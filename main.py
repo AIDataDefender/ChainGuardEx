@@ -19,7 +19,7 @@ from experiments.model import Model
 from experiments.dataset import ModelDataset
 from experiments.training import train
 from experiments.evaluation import evaluate, test
-from experiments.common_utils import set_seed
+from experiments.utils.common_utils import set_seed
 
 # Environment setup
 TF_ENABLE_ONEDNN_OPTS = 0
