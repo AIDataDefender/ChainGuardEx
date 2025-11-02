@@ -171,6 +171,7 @@ class CustomDataset(Dataset):
     #####################################################################
     def _save_data(self, save_path , type="both"):
         try:
+            os.makedirs(self.save_load_dir, exist_ok=True)
             # region SAVE DATA
             if type == "both":
                 torch.save(self.dataset_code, save_path.replace("_dataset.pt", "_code_dataset.pt"))
@@ -188,6 +189,7 @@ class CustomDataset(Dataset):
     #####################################################################
     def _load_data(self, load_path, type="both"):
         try:
+            os.makedirs(self.save_load_dir, exist_ok=True)
             # region LOAD DATA
             if type == "both":
                 code_path = load_path.replace("_dataset.pt", "_code_dataset.pt")
@@ -424,7 +426,7 @@ def custom_collate(batch):
 
 if __name__ == "__main__":
     # region TESTING 
-    dataset = CustomDataset("cccc",None, source="DAppSCAN", file_path="./train.txt",force_reload=False, load_type="code")
+    dataset = CustomDataset("cccc",None, source="DAppSCAN", file_path="./train.txt",force_reload=True, load_type="graph")
     # Print dataset length
     print(f"Dataset loaded with {len(dataset.dataset_graph)} - {len(dataset.dataset_code)} samples.")
     # Print a sample item and details

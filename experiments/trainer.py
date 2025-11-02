@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+
 from tqdm import tqdm
 from dgl.dataloading import GraphDataLoader
 from torch.utils.data import random_split, Subset
@@ -28,24 +30,98 @@ try:
     sys.path.append(parent_dir)
     from experiments.dataset import CustomDataset, custom_collate
     from experiments.utils.logger import setup_logger
-    from experiments.models.baseline2 import CombinedModel 
+    from experiments.models.baseline3 import CombinedModel 
             
 except ImportError:
     from dataset import CustomDataset, custom_collate
     from utils.logger import setup_logger
-    from models.baseline2 import CombinedModel 
+    from experiments.models.baseline3 import CombinedModel 
             
             
 # Initialize logger for training process
 logger = setup_logger("Logs/trainer.log", logging.INFO)
 
 
+
+class FocalLoss(nn.Module):
+    """
+    Implements the Focal Loss from the paper "Focal Loss for Dense Object Detection".
+    
+    This loss is designed for extreme class imbalance, such as the node-level
+    labels in your GNN tasks (e.g., 0.04% positive).
+    
+    It applies a modulating factor (1 - p_t)^gamma to the standard cross-entropy loss.
+    This down-weights the loss from easy-to-classify (benign) nodes, forcing
+    the model to focus on the rare, hard-to-classify (vulnerable) nodes.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='none'):
+        """
+        Args:
+            alpha (float): Balances positive/negative examples.
+                            (e.g., 0.25 for positive class, 0.75 for negative class)
+            gamma (float): The focusing parameter. Higher values (e.g., 2.0)
+                            apply a stronger penalty to easy examples.
+            reduction (str): 'none', 'mean', or 'sum'.
+                                'none' is required to work with the Trainer's
+                                _compute_masked_loss function.
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs (torch.Tensor): The model's raw output logits
+                                    (shape: [B, max_len, C] or [N, C])
+            targets (torch.Tensor): The ground-truth labels (binary)
+                                    (shape: [B, max_len, C] or [N, C])
+        
+        Returns:
+            torch.Tensor: The computed Focal Loss (unreduced if reduction='none')
+        """
+        # Ensure targets are float
+        targets = targets.float()
+        
+        # Calculate BCE loss (numerically stable)
+        # This gives: -[ y*log(p) + (1-y)*log(1-p) ]
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        # Calculate sigmoid probabilities
+        p = torch.sigmoid(inputs)
+        
+        # Calculate p_t (probability of the *correct* class)
+        # p_t = p if y=1, and (1-p) if y=0
+        p_t = p * targets + (1 - p) * (1 - targets)
+        
+        # Calculate the modulating factor: (1 - p_t)^gamma
+        modulating_factor = (1.0 - p_t).pow(self.gamma)
+        
+        # Calculate the alpha weight factor
+        # alpha_weight = alpha if y=1, and (1-alpha) if y=0
+        alpha_weight = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        
+        # Compute the final Focal Loss
+        # FL = alpha_weight * modulating_factor * BCE_loss
+        focal_loss = alpha_weight * modulating_factor * BCE_loss
+
+        # Apply reduction if specified
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            # Default: 'none', as required by the trainer's masking function
+            return focal_loss
+
+
 class Trainer:
     # region Initialization
     def __init__(self,
                 batch_size=4, 
-                num_epochs=10, 
-                learning_rate=0.001,
+                num_epochs=100, 
+                learning_rate=2e-5,
                 patience=5,
                 hidden_dim=256, 
                 rand_seed=42
@@ -117,7 +193,7 @@ class Trainer:
         #   ['cg', 'cfg', 'dfg'] - Only use graphs (no code)
         #   ['code', 'cg', 'cfg', 'dfg'] - Use everything (default)
         #   ['cg'] - Only use Call Graph
-        self.task_keys = [ 'code', 'cg', 'cfg', 'dfg' ]  # <-- MODIFY THIS TO CHANGE TASKS
+        self.task_keys = [ 'cg', 'cfg', 'dfg' ]  # <-- MODIFY THIS TO CHANGE TASKS
         
         # Determine which branches to use based on task_keys
         self.use_code = 'code' in self.task_keys
@@ -423,15 +499,15 @@ class Trainer:
             
             ratio = neg_count / (pos_count + 1e-8)
             
-            if task_key == 'cg':
-                pos_weight = torch.clamp(ratio, max=4.0)
-            elif task_key == 'cfg':
-                pos_weight = torch.pow(ratio, 0.33)
-            else:
-                # The others are fine with sqrt
-                pos_weight = torch.sqrt(ratio)
+            # if task_key == 'cg':
+            #     pos_weight = torch.clamp(ratio, max=4.0)
+            # elif task_key == 'cfg':
+            #     pos_weight = torch.pow(ratio, 0.33)
+            # else:
+            #     # The others are fine with sqrt
+            #     pos_weight = torch.sqrt(ratio)
             
-            pos_weight = torch.clamp(pos_weight, max=100.0)
+            pos_weight = torch.clamp(ratio, min=1.0, max=100.0)
             pos_weight[pos_count == 0] = 1.0
             
             weights[task_key] = pos_weight
@@ -476,6 +552,14 @@ class Trainer:
         # Only create criteria for active tasks
         self.criteria = {}
         for task_key in self.task_keys:
+            # Graph tasks use Focal Loss due to extreme sparsity
+            if 'cg' in task_key:
+                self.criteria['cg'] = FocalLoss(gamma=2.0, reduction='none', alpha=0.25)
+            if 'cfg' in task_key:
+                self.criteria['cfg'] = FocalLoss(gamma=2.0, reduction='none', alpha=0.25)
+            if 'dfg' in task_key:
+                self.criteria['dfg'] = FocalLoss(gamma=2.0, reduction='none', alpha=0.25)
+
             self.criteria[task_key] = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weights[task_key])
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)

@@ -77,12 +77,13 @@ class RawCodeFeatureExtractor:
         # Convert to string if not already
         code = str(code)
         
-        # Remove excessive whitespace
+        # More robust regex to remove C-style comments (single-line and multi-line)
+        # This will remove // ... and /* ... */, which may contain leaked labels.
+        # re.DOTALL makes . match newlines, for multi-line /* ... */
+        # re.MULTILINE makes $ match end-of-line, for // ...
+        code = code = re.sub(r'//.*?$|/\*.*?\*/|/\*.*|\*/.*?(?=\n|$)', '', code, flags=re.DOTALL | re.MULTILINE)
+        # Remove excessive whitespace (now do this *after* comment removal)
         code = re.sub(r'\s+', ' ', code)
-        
-        # Remove comments (basic cleaning)
-        code = re.sub(r'//.*?\n', ' ', code)  # Single line comments
-        code = re.sub(r'/\*.*?\*/', ' ', code, flags=re.DOTALL)  # Multi-line comments
         
         # Normalize common patterns
         code = re.sub(r'\b0x[a-fA-F0-9]+\b', '<ADDRESS>', code)  # Replace addresses
@@ -90,7 +91,7 @@ class RawCodeFeatureExtractor:
         
         # Strip and clean
         code = code.strip()
-        logger.debug(f"Preprocessed code: {code[:200]}...")  
+        logger.debug(f"\n==============CLEANED CODE============\n{code}\n==========================")  
         return code
     
     def create_combined_features(self, row: pd.Series) -> str:
@@ -106,9 +107,6 @@ class RawCodeFeatureExtractor:
         features = []
         #DataFrame columns: ['filename', 'contract', 'func', 'func_raw_code', 'vuln_id', 'vuln_desc', 'vuln_line_code', 'item_type']
         # Add metadata features
-        if not pd.isna(row['filename']):
-            features.append(f"FILE: {row['filename']}")
-        
         if not pd.isna(row['contract']):
             features.append(f"CONTRACT: {row['contract']}")
         
@@ -251,13 +249,7 @@ class RawCodeFeatureExtractor:
                 # Create labels
                 logger.info(f"Processing dataframe {project_name}: Step 3 - Creating labels")
                 labels = self.create_labels(df)
-                
-                # Store result as tuple (key, data_dict)
-                results.append((project_name,{
-                    'features': features,
-                    'labels': labels
-                }))
-                
+            
                 # Compile statistics
                 logger.info(f"Dataframe {project_name} - feature_shape: {features.shape}, label_shape: {labels.shape}")
                 
