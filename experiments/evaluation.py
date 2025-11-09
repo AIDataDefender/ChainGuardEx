@@ -4,7 +4,7 @@ Handles model evaluation and testing with various metrics.
 """
 
 import logging
-from experiments.utils.logger import setup_logger
+from experiments.the_utils.logger import setup_logger
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, SequentialSampler

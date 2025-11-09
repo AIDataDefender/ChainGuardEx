@@ -25,12 +25,16 @@ from Data.DAppSCAN.f6_DAppSCAN_fetch_data_adapter import f6_fetch_DAppSCAN_data
 
 from experiments.graph_processing import GraphFeatureExtractor
 from experiments.raw_code_processing import RawCodeFeatureExtractor
-from experiments.utils.logger import setup_logger
+from experiments.the_utils.logger import setup_logger
 from datetime import datetime
 
-os.makedirs("Logs", exist_ok=True)
-logger = setup_logger("Logs/Dataset.log")
+# We'll set LOG_FOLDER from environment or use default
+log_folder = os.getenv('LOG_FOLDER', 'Logs')
+os.makedirs(log_folder, exist_ok=True)
+logger = setup_logger(f"{log_folder}/Dataset.log")
 
+os.environ['DGLBACKEND'] = 'pytorch'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 ## DEFINE INPUTS
 
 class CustomDataset(Dataset):
@@ -40,22 +44,27 @@ class CustomDataset(Dataset):
         # region INIT
         logger.info("Initializing CustomDataset...")
         self.set_rand_seed(rand_seed)
-
-        self.tokenizer = AutoTokenizer.from_pretrained('microsoft/codebert-base', use_fast=True)
-        self.embedding_model = AutoModel.from_pretrained('microsoft/codebert-base')
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.warning(f"Using device: {self.device}")
         
         self.args = args
         self.dataset_code = []
         self.dataset_graph = []
+
+        if force_reload:
+            self.tokenizer = AutoTokenizer.from_pretrained('microsoft/codebert-base', use_fast=True)
+            self.embedding_model = AutoModel.from_pretrained('microsoft/codebert-base')
+        else:
+            self.tokenizer = None
+            self.embedding_model = None
+            logger.warning("Only load data mode !")
+            
         self.GraphFeatureExtractorModule = GraphFeatureExtractor(None, 
                                                                 self.device)
         
         self.RawCodeFeatureExtractorModule = RawCodeFeatureExtractor(self.tokenizer, 
                                                                     self.embedding_model, 
                                                                     self.device)
-        
         
         self.ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_load_dir = "./processed_data"
@@ -87,9 +96,12 @@ class CustomDataset(Dataset):
         try:
             #check if data already processed
             if not force_reload:
-                self._load_data(saved_file, type="both")
-                logger.warning(f"DAppSCAN data loaded from previous.")
-                return
+                x = self._load_data(saved_file, type="both")
+                if x:
+                    logger.warning(f"DAppSCAN data loaded from previous.")
+                    return
+                else:
+                    logger.warning(f"No existing DAppSCAN data found. Proceeding to fetch and process.")
             else:
                 logger.warning(f"Forcing reload and preprocessing of DAppSCAN data {load_type}.")
                 if load_type in ["graph","code"]:
@@ -125,11 +137,13 @@ class CustomDataset(Dataset):
 
             if not hetero_cpg_graph_list and not self.dataset_graph:
                 print(hetero_cpg_graph_list)
+                print(self.dataset_graph)
                 logger.error("[GRAPH] Processing resulted in empty data. Please check the processing steps.")
                 return
 
             if not source_code_list and not self.dataset_code:
                 print(source_code_list)
+                print(self.dataset_code)
                 logger.error("[CODE] Processing resulted in empty data. Please check the processing steps.")
                 return
 
@@ -425,8 +439,25 @@ def custom_collate(batch):
         }
 
 if __name__ == "__main__":
-    # region TESTING 
-    dataset = CustomDataset("cccc",None, source="DAppSCAN", file_path="./train.txt",force_reload=True, load_type="graph")
+    # region TESTING
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Test dataset loading and inspection')
+    parser.add_argument('--force_reload', action='store_true', 
+                        help='Force reload and reprocess data from source')
+    parser.add_argument('--load_type', type=str, default='both', 
+                        choices=['both', 'graph', 'code'],
+                        help='Type of data to load: both, graph, or code')
+    args = parser.parse_args()
+    
+    dataset = CustomDataset(
+        "cccc", 
+        None, 
+        source="DAppSCAN", 
+        file_path="./train.txt",
+        force_reload=args.force_reload, 
+        load_type=args.load_type
+    )
     # Print dataset length
     print(f"Dataset loaded with {len(dataset.dataset_graph)} - {len(dataset.dataset_code)} samples.")
     # Print a sample item and details

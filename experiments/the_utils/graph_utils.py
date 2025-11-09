@@ -2,14 +2,6 @@
 
 import os
 from typing import Dict, List
-try:
-    from experiments.utils.logger import setup_logger
-except ImportError:
-    from utils.logger import setup_logger
-
-os.makedirs("Logs", exist_ok=True)
-logger = setup_logger("Logs/GraphUtils.log")
-
 OPCODE_VOCAB = [
 
         # ===============================
@@ -125,17 +117,17 @@ OPCODE_VOCAB = [
 
 # === Module-level constant lists used by one-hot helpers ===
 OWASP_VULN = [
-    "SC01:2025",
+    "SC01:2025",  # Reentrancy
     # "SC02:2025",
-    "SC03:2025",
-    "SC04:2025",
-    "SC05:2025",
-    "SC06:2025",
+    "SC03:2025",  # Access Control
+    "SC04:2025",  # Arithmetic
+    "SC05:2025",  # Unchecked Call
+    "SC06:2025",  # Denial of Service
     # "SC07:2025",
-    "SC08:2025",
-    "SC09:2025",
-    "SC10:2025",
-    "BENIGN",
+    "SC08:2025",  # Bad Randomness
+    "SC09:2025",  # Front Running
+    "SC10:2025",  # Time Manipulation
+    # BENIGN removed - absence of all vulnerabilities = benign (multilabel)
 ]
 
 VAR_VISIBILITY = [
@@ -196,7 +188,6 @@ CFG_NODE_TYPE_LIST = [
     "throw",
     "break",
     "continue",
-    "_",
     "try",
     "catch",
     "other_entrypoint",
@@ -269,29 +260,6 @@ CALL_OPCODE = [
     "CROSS_CONTRACT",         # destination in another contract
 ]
 
-AST_EDGES_TYPES = [
-    "ControlFlow",
-    "Declaration",
-    "Expression",
-    "FunctionCall",
-    "Access",
-    "Conversion",
-    "Return",
-    "ErrorHandling",
-    "Inheritance",
-    "ModifierInvocation",
-    "ArrayType",
-    "MappingType",
-    "NewExpression",
-    "TupleExpression",
-    "VariableDeclarationStatement",
-    "BlockStatement",
-    "ContractBody",
-    "FunctionParameters",
-    "ModifierParameters",
-    "Next",  # fallback / sequential edge
-]
-
 
 def get_all_list_lengths() -> Dict[str, int]:
     """Return lengths of the constant lists so callers (eg. GraphFeatureExtractor)
@@ -327,25 +295,20 @@ def vuln_to_label(owasp_list):
     """
     Convert OWASP vulnerability list to multi-hot label vector.
     
-    CRITICAL: This function is a key point for potential label leaks.
-    If owasp_list is None/empty, returns all zeros except BENIGN=1.
-    Otherwise, sets corresponding vulnerability indices to 1.
+    For multilabel classification with 8 vulnerability types:
+    - If owasp_list is None/empty: returns all zeros (benign = no vulnerabilities)
+    - Otherwise: sets corresponding vulnerability indices to 1.0
     
     Args:
         owasp_list: List of OWASP vulnerability IDs (e.g., ['SC01:2025', 'SC03:2025'])
     
     Returns:
-        List of floats (length = len(OWASP_VULN)) with 1.0 for present vulnerabilities
-    
-    DEBUGGING: Enable logging to track label generation
+        List of floats (length = 8) with 1.0 for present vulnerabilities, 0.0 otherwise
     """
-    labels = [0.0] * len(OWASP_VULN)
+    labels = [0.0] * len(OWASP_VULN)  # Initialize all to 0.0
     
-    # Case 1: No vulnerabilities - mark as BENIGN
+    # Case 1: No vulnerabilities - return all zeros (benign)
     if not owasp_list:
-        labels[-1] = 1.0  # BENIGN is the last element
-        # Uncomment for debugging:
-        # logger.debug(f"vuln_to_label: No vulnerabilities -> BENIGN label")
         return labels
     
     # Case 2: Has vulnerabilities - set corresponding indices
@@ -353,23 +316,17 @@ def vuln_to_label(owasp_list):
     for owasp in (owasp_list or []):
         key = str(owasp).upper().strip()
         
-        # POTENTIAL BUG CHECK: Ensure key is in the list
         if key in OWASP_VULN:
             idx = OWASP_VULN.index(key)
             labels[idx] = 1.0
             found_any = True
-            # Uncomment for debugging:
-            # logger.debug(f"vuln_to_label: Found {key} at index {idx}")
         else:
             # WARNING: Unknown vulnerability ID - not in OWASP_VULN list
-            # This could indicate data mismatch or outdated vocabulary
-            logger.warning(f"vuln_to_label: Unknown vulnerability '{key}' not in OWASP_VULN list")
+            print(f"vuln_to_label: Unknown vulnerability '{key}' not in OWASP_VULN list")
     
-    # SANITY CHECK: If we had a list but found nothing, something is wrong
+    # SANITY CHECK: If we had a list but found nothing, log warning
     if not found_any and owasp_list:
-        logger.warning(f"vuln_to_label: Had vulnerability list {owasp_list} but no matches found!")
-        # Default to BENIGN if nothing matched
-        labels[-1] = 1.0
+        print(f"vuln_to_label: Had vulnerability list {owasp_list} but no matches found!")
     
     return labels
 

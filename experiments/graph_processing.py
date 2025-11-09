@@ -14,15 +14,16 @@ from tqdm import tqdm
 import warnings
 from collections import defaultdict
 try:
-    from experiments.utils.logger import setup_logger
-    from experiments.utils.graph_utils import *  ## MOST IMPORTANT AS IT CONTAINS ALL THE VALUES
+    from experiments.the_utils.logger import setup_logger
+    from experiments.the_utils.graph_utils import *  ## MOST IMPORTANT AS IT CONTAINS ALL THE VALUES
 except ImportError:
-    from utils.logger import setup_logger
-    from utils.graph_utils import *  ## MOST IMPORTANT AS IT CONTAINS ALL THE VALUES
+    from the_utils.logger import setup_logger
+    from the_utils.graph_utils import *  ## MOST IMPORTANT AS IT CONTAINS ALL THE VALUES
 import hashlib 
 # Configure logging
-os.makedirs("Logs", exist_ok=True)
-logger = setup_logger("Logs/GraphProcessing.log")
+log_folder = os.getenv('LOG_FOLDER', 'Logs')
+os.makedirs(log_folder, exist_ok=True)
+logger = setup_logger(f"{log_folder}/GraphProcessing.log")
 
 class GraphFeatureExtractor:
     def __init__(self, tokenizer=None , device=None):
@@ -32,17 +33,18 @@ class GraphFeatureExtractor:
         self.max_modifiers = 10  # maximum number of modifiers to consider
         self.max_structs = 10  # maximum number of structs to consider
 
-        self.vuln_node_cfg_dim =  len(OWASP_VULN) # 1 + 1 + len(CFG_NODE_TYPE_LIST) + len(OWASP_VULN) + 2  # vuln flag + contract hash + func hash + one-hot + vuln vector
-        self.vuln_node_cg_dim =  len(OWASP_VULN) # 1 + 1 + len(CG_NODE_TYPE_LIST) + len(OWASP_VULN) + 2
+        self.vuln_node_cfg_dim =  len(OWASP_VULN) # 8 vulnerability types (no Benign)
+        self.vuln_node_cg_dim =  len(OWASP_VULN) # 8 vulnerability types (no Benign)
+        self.vuln_node_dfg_dim = len(OWASP_VULN)  # 8 vulnerability types (no Benign)
         # CFG NODE FEATURES DIMENSIONS
         # self.cfg_ir_token_dim = 128
         # self.cfg_code_token_dim = 128
-        self.cfg_node_feat_dim =  len(CFG_NODE_TYPE_LIST) + 1 + 1  + 1  + 1 + self.max_structs 
+        self.cfg_node_feat_dim =  len(CFG_NODE_TYPE_LIST) + 1 + 1 + self.max_structs + len(STATE_MUTABILITY) + len(FUNC_VISIBILITY) + 3 + len(OPCODE_HIST)  # one-hot + vuln (2) + contract hash + func hash + 7 additional
         
         ###################################################
         #  CG NODE FEATURES DIMENSIONS
         
-        self.cg_node_feat_dim = len(CG_NODE_TYPE_LIST) + 1 + len(CONTRACT_KIND) + 1 + self.max_modifiers + self.max_structs + len(STATE_MUTABILITY) + len(FUNC_VISIBILITY) + 4 + len(OPCODE_HIST)  # one-hot + vuln (2) + contract hash + func hash + 7 additional
+        self.cg_node_feat_dim = len(CG_NODE_TYPE_LIST) + 1 + len(CONTRACT_KIND) + 1 + self.max_modifiers + self.max_structs + len(STATE_MUTABILITY) + len(FUNC_VISIBILITY) + 3 + len(OPCODE_HIST)  # one-hot + vuln (2) + contract hash + func hash + 7 additional
 
         ###################################################
         #  AST NODE FEATURES DIMENSIONS
@@ -50,8 +52,44 @@ class GraphFeatureExtractor:
 
         ###################################################
         #  DFG NODE FEATURES DIMENSIONS
-        self.dfg_node_feat_dim = len(AST_NODE_TYPE_LIST) + 1 + 1 + 1 + 1  # node_type one-hot + contract hash + function hash + var hash + src length
-        self.vuln_node_dfg_dim = len(OWASP_VULN)  # vulnerability label dimensions
+        # Enhanced DFG features include:
+        # - node_type one-hot (AST_NODE_TYPE_LIST)
+        # - contract hash + function hash + var/identifier hash
+        # - src length (positional encoding)
+        # - type string hash (variable/expression type)
+        # - storage location one-hot (VAR_STORAGE)
+        # - visibility one-hot (FUNC_VISIBILITY for functions, VAR_VISIBILITY for variables)
+        # - mutability flags (constant, stateVariable, isConstant, isPure, isLValue)
+        # - state mutability one-hot (STATE_MUTABILITY)
+        # - function flags (isConstructor, isFallback, isReceive, virtual, implemented)
+        # - operator hash (for binary/unary operations)
+        # - memberName hash (for member access)
+        # - literal value hash (for literal nodes)
+        # - opcode histogram
+        self.max_dfg_modifiers = 5  # maximum modifiers for DFG nodes
+        self.dfg_node_feat_dim = (
+            len(AST_NODE_TYPE_LIST) +  # node_type one-hot
+            1 +  # contract hash
+            1 +  # function hash  
+            1 +  # var/identifier hash
+            1 +  # src length
+            1 +  # type hash
+            len(VAR_STORAGE) +  # storage location one-hot
+            len(FUNC_VISIBILITY) +  # visibility one-hot (using FUNC_VISIBILITY as it covers VAR_VISIBILITY)
+            5 +  # mutability flags (constant, stateVariable, isConstant, isPure, isLValue)
+            len(STATE_MUTABILITY) +  # state mutability one-hot
+            5 +  # function flags (isConstructor, isFallback, isReceive, virtual, implemented)
+            1 +  # operator hash
+            1 +  # memberName hash
+            1 +  # literal value hash
+            self.max_dfg_modifiers +  # modifiers (hashed, fixed length)
+            1 +  # scope hash
+            len(OPCODE_HIST)  # opcode histogram
+        )
+        
+        ###################################################
+        #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#
+        ###################################################
 
         ###################################################
         # CFG EDGES FEATURES DIMENSIONS 
@@ -70,8 +108,29 @@ class GraphFeatureExtractor:
 
         ###################################################
         # DFG EDGES FEATURES DIMENSIONS
-
-        self.dfg_edge_feat_dim = len(DFG_EDGE_TYPES) + len(DFG_FLOW_LABELS) + 1 + 1 + 1  # edge_type one-hot + flow one-hot + frequency + src_var hash + dst_var hash
+        # Enhanced DFG edge features include:
+        # - edge_type one-hot (DFG_EDGE_TYPES: 9 types)
+        # - flow label one-hot (DFG_FLOW_LABELS: 13 types)
+        # - frequency (1 float)
+        # - src_var hash (1 float)
+        # - dst_var hash (1 float)
+        # - operator hash (1 float) - for assignment edges
+        # - contract hash (1 float)
+        # - function hash (1 float)
+        # - src_offset (1 float) - source location offset
+        # - src_length (1 float) - source location length
+        # - is_external_call (1 boolean) - for call-arg edges
+        self.dfg_edge_feat_dim = (
+            len(DFG_EDGE_TYPES) +  # edge_type one-hot
+            len(DFG_FLOW_LABELS) +  # flow label one-hot
+            1 +  # frequency
+            1 +  # src_var hash
+            1 +  # dst_var hash
+            1 +  # operator hash
+            1 +  # contract hash
+            1 +  # function hash
+            1    # is_external_call
+        )
 
 
         ###################################################
@@ -89,10 +148,10 @@ class GraphFeatureExtractor:
         return {
             # Graph input dimensions (node features)
             "GRAPH_IN_DIMS": {
-                "ast_node": self.ast_node_feat_dim,  # Should be 55
-                "block": self.cfg_node_feat_dim,      # Should be 33
-                "function": self.cg_node_feat_dim,    # Should be 57
-                "dfg_node": self.dfg_node_feat_dim    # DFG node features
+                "ast_node": self.ast_node_feat_dim + 1, # 1 node ID hash feature
+                "block": self.cfg_node_feat_dim + 1,     # 1 node ID hash feature
+                "function": self.cg_node_feat_dim + 1,   # 1 node ID hash feature
+                "dfg_node": self.dfg_node_feat_dim + 1    # 1 node ID hash feature
             },
             
             # Additional dimensions for reference
@@ -200,37 +259,7 @@ class GraphFeatureExtractor:
         one_hot = node_type_to_one_hot(node_type, CFG_NODE_TYPE_LIST)
         features.extend(one_hot)
         true_length.append(len(one_hot))
-        # 3. raw_ir: length
-        raw_ir = node_data.get("raw_ir", "")
-        features.append(float(len(raw_ir)))
-        true_length.append(1)
-        # tokenized_ir = self.tokenizer(
-        #                     raw_ir,
-        #                     truncation=True,
-        #                     padding="max_length",
-        #                     max_length=self.cfg_ir_token_dim,
-        #                     return_tensors="pt",
-        #                     return_overflowing_tokens=True,
-        #                     dtype=self.dtype
-        #                 )
-        # print(f"Exceeded {len(tokenized_ir['overflowing_tokens'])} tokens in raw_ir.")
-        # features.extend(tokenized_ir['input_ids'])
 
-        # 4. raw_code: length
-        raw_code = node_data.get("raw_code", "")
-        features.append(float(len(raw_code)))
-        true_length.append(1)
-        # tokenized_code = self.tokenizer(
-        #                     raw_code,
-        #                     truncation=True,
-        #                     padding="max_length",
-        #                     max_length=self.cfg_code_token_dim,
-        #                     return_tensors="pt",
-        #                     return_overflowing_tokens=True,
-        #                     dtype=self.dtype
-        #                 )
-        # print(f"Exceeded {len(tokenized_code['overflowing_tokens'])} tokens in raw_code.")
-        # features.extend(tokenized_code['input_ids'])
 
         # 5. contract_name: hash encoding
         contract_name = node_data.get("contract_name", "")
@@ -252,6 +281,41 @@ class GraphFeatureExtractor:
             for _ in range(self.max_structs - len(structs)):
                 features.append(0.0)  # padding
         true_length.append(self.max_structs)
+
+        state_multability = node_data.get("stateMutability","none")
+        sm_oh = func_stateMutability_to_one_hot(state_multability)
+        features.extend(sm_oh)
+        true_length.append(len(sm_oh))
+
+        # visibility one-hot
+        func_visibility = node_data.get("visibility", "internal")
+        vis_oh = func_visibility_to_one_hot(func_visibility)
+        features.extend(vis_oh)
+        true_length.append(len(vis_oh))
+
+        isConstructor = node_data.get("isConstructor", False)
+        isConstructor = self._safe_literal_eval(isConstructor, default=False)
+        features.append(float(isConstructor))
+        true_length.append(1)
+
+        isFallback = node_data.get("isFallback", False)
+        isFallback = self._safe_literal_eval(isFallback, default=False)
+        features.append(float(isFallback))
+        true_length.append(1)
+
+        isReceive = node_data.get("isReceive", False)
+        isReceive = self._safe_literal_eval(isReceive, default=False)
+        features.append(float(isReceive))
+        true_length.append(1)
+
+        # opcode histogram
+        opcode_hist = node_data.get("opcode_hist", {})
+        opcode_hist = self._safe_literal_eval(opcode_hist, default={})
+        op_hist_feat = op_code_histogram_to_feat(opcode_hist)
+        features.extend(op_hist_feat)
+        true_length.append(len(op_hist_feat))
+
+
         if not sum(true_length) == self.cfg_node_feat_dim:
             logger.warning(f"CFG Node feature dim mismatch: expected {sum(true_length)}, got {self.cfg_node_feat_dim}")
         
@@ -358,11 +422,6 @@ class GraphFeatureExtractor:
         features.extend(modifier_hashes)
         true_length.append(self.max_modifiers)
 
-        # boolean flags
-        isImplemented = node_data.get("isImplemented", False)
-        isImplemented = self._safe_literal_eval(isImplemented, default=False)
-        features.append(float(isImplemented))
-        true_length.append(1)
 
         isConstructor = node_data.get("isConstructor", False)
         isConstructor = self._safe_literal_eval(isConstructor, default=False)
@@ -389,8 +448,7 @@ class GraphFeatureExtractor:
         if not sum(true_length) == self.cg_node_feat_dim:
             logger.warning(f"CG Node feature dim mismatch: expected {sum(true_length)}, got {self.cg_node_feat_dim}")
         
-
-        # Vuln node marking
+        # Vulnerability labels
         vuln_node = None
         node_vulns = node_data.get("node_vulns", [])
         node_vulns = self._safe_literal_eval(node_vulns, default=[])
@@ -402,7 +460,6 @@ class GraphFeatureExtractor:
             # vuln_node.extend(one_hot)
             # vuln_node.extend(vuln_vector)
             vuln_node = vuln_vector
-        
         
         return features, vuln_node
         
@@ -469,18 +526,55 @@ class GraphFeatureExtractor:
         
     def _dfg_node_features(self, node_data):
         # DFG NODE DATA STRUCTURE (from combine_dfgs_to_pydot in e_4generate_enrichDFG.py):
-        # Actual .dot file format:
+        # Enhanced structure with enrichment from project_json and normalization:
         # {
-        #     "node_type": normalized_category,     # e.g., "Return", "ElementaryType", "Identifier"
-        #     "raw_node_type": original_type,       # e.g., "Return", "uint256"
-        #     "node_name": identifier_name,         # e.g., "Return", "Identifier", "FunctionCall"
+        #     "node_type": normalized_category,          # e.g., "Return", "ElementaryType", "Identifier"
+        #     "raw_node_type": original_type,            # e.g., "Return", "uint256"
+        #     "name": identifier_name,                   # Variable/function/event name
         #     "contract_name": contract_name,            # Contract containing this node
         #     "function_name": function_name,            # Function containing this node
-        #     "src": "offset:length:fileId",        # Source location
-        #     "operator": operator,                 # For BinaryOp/UnaryOp (optional)
-        #     "var": variable_name,                 # Variable name (optional)
-        #     "type": type_string,                  # Variable type (optional)
-        #     "node_vulns": vuln_list               # List of vulnerabilities like ["SC01:2025"]
+        #     "src": "offset:length:fileId",             # Source location
+        #     
+        #     # Type and storage
+        #     "type": type_string,                       # Variable/expression type
+        #     "storageLocation": storage,                # memory/storage/calldata
+        #     "visibility": visibility,                  # private/public/internal/external
+        #     
+        #     # Mutability flags
+        #     "constant": bool,                          # Is constant variable
+        #     "stateVariable": bool,                     # Is state variable
+        #     "isConstant": bool,                        # Is constant expression
+        #     "isPure": bool,                            # Is pure expression
+        #     "isLValue": bool,                          # Is L-value
+        #     "mutability": str,                         # Variable mutability
+        #     
+        #     # Operators and access
+        #     "operator": operator,                      # For BinaryOp/UnaryOp
+        #     "memberName": member_name,                 # For member access
+        #     
+        #     # Literal values
+        #     "value": literal_value,                    # For literals
+        #     "hexValue": hex_value,                     # For literals
+        #     
+        #     # Function attributes (for function nodes)
+        #     "func_visibility": visibility,             # Function visibility
+        #     "func_state_mutability": state_mut,        # pure/view/nonpayable/payable
+        #     "func_is_constructor": bool,
+        #     "func_is_fallback": bool,
+        #     "func_is_receive": bool,
+        #     "func_virtual": bool,
+        #     "func_implemented": bool,
+        #     "func_modifiers": [modifier_list],         # Function modifiers
+        #     
+        #     # Scope and references
+        #     "scope": scope_id,                         # Scope reference
+        #     "referencedDeclaration": decl_id,          # Referenced declaration
+        #     
+        #     # Opcode analysis
+        #     "opcode_hist": {opcode: count},            # Opcode histogram
+        #     
+        #     # Vulnerabilities
+        #     "node_vulns": vuln_list                    # List of vulnerabilities like ["SC01:2025"]
         # }
         true_length = []
         features = []
@@ -505,9 +599,9 @@ class GraphFeatureExtractor:
         features.append(func_hash)
         true_length.append(1)
         
-        # 4. Variable/node name hash
-        # Priority: "var" field > "node_name" field > "name" field
-        var_name = node_data.get("var", "") or node_data.get("node_name", "") or node_data.get("name", "")
+        # 4. Variable/identifier/node name hash
+        # Priority: "name" field > "var" field > "node_name" field
+        var_name = node_data.get("name", "") or node_data.get("var", "") or node_data.get("node_name", "")
         var_hash = self._hash_md5_f32(var_name)
         features.append(var_hash)
         true_length.append(1)
@@ -525,8 +619,129 @@ class GraphFeatureExtractor:
         features.append(src_length)
         true_length.append(1)
         
+        # 6. Type string hash (variable/expression type)
+        type_str = node_data.get("type", "")
+        type_hash = self._hash_md5_f32(type_str)
+        features.append(type_hash)
+        true_length.append(1)
+        
+        # 7. Storage location one-hot (memory/storage/calldata)
+        storage_location = node_data.get("storageLocation", "none")
+        storage_oh = var_storage_to_one_hot(storage_location)
+        features.extend(storage_oh)
+        true_length.append(len(storage_oh))
+        
+        # 8. Visibility one-hot
+        # For variables, use visibility; for functions, use func_visibility
+        visibility = node_data.get("visibility", "") or node_data.get("func_visibility", "internal")
+        vis_oh = func_visibility_to_one_hot(visibility)
+        features.extend(vis_oh)
+        true_length.append(len(vis_oh))
+        
+        # 9. Mutability flags (5 binary features)
+        constant = node_data.get("constant", False)
+        constant = self._safe_literal_eval(constant, default=False)
+        features.append(float(constant))
+        
+        state_variable = node_data.get("stateVariable", False)
+        state_variable = self._safe_literal_eval(state_variable, default=False)
+        features.append(float(state_variable))
+        
+        is_constant = node_data.get("isConstant", False)
+        is_constant = self._safe_literal_eval(is_constant, default=False)
+        features.append(float(is_constant))
+        
+        is_pure = node_data.get("isPure", False)
+        is_pure = self._safe_literal_eval(is_pure, default=False)
+        features.append(float(is_pure))
+        
+        is_lvalue = node_data.get("isLValue", False)
+        is_lvalue = self._safe_literal_eval(is_lvalue, default=False)
+        features.append(float(is_lvalue))
+        
+        true_length.append(5)
+        
+        # 10. State mutability one-hot (for functions)
+        state_mutability = node_data.get("func_state_mutability", "") or node_data.get("stateMutability", "none")
+        sm_oh = func_stateMutability_to_one_hot(state_mutability)
+        features.extend(sm_oh)
+        true_length.append(len(sm_oh))
+        
+        # 11. Function flags (5 binary features)
+        is_constructor = node_data.get("func_is_constructor", False)
+        is_constructor = self._safe_literal_eval(is_constructor, default=False)
+        features.append(float(is_constructor))
+        
+        is_fallback = node_data.get("func_is_fallback", False)
+        is_fallback = self._safe_literal_eval(is_fallback, default=False)
+        features.append(float(is_fallback))
+        
+        is_receive = node_data.get("func_is_receive", False)
+        is_receive = self._safe_literal_eval(is_receive, default=False)
+        features.append(float(is_receive))
+        
+        is_virtual = node_data.get("func_virtual", False)
+        is_virtual = self._safe_literal_eval(is_virtual, default=False)
+        features.append(float(is_virtual))
+        
+        is_implemented = node_data.get("func_implemented", True)
+        is_implemented = self._safe_literal_eval(is_implemented, default=True)
+        features.append(float(is_implemented))
+        
+        true_length.append(5)
+        
+        # 12. Operator hash (for binary/unary operations)
+        operator = node_data.get("operator", "")
+        operator_hash = self._hash_md5_f32(operator)
+        features.append(operator_hash)
+        true_length.append(1)
+        
+        # 13. Member name hash (for member access)
+        member_name = node_data.get("memberName", "")
+        member_hash = self._hash_md5_f32(member_name)
+        features.append(member_hash)
+        true_length.append(1)
+        
+        # 14. Literal value hash (for literal nodes)
+        # Use hexValue if available, otherwise use value
+        literal_value = node_data.get("hexValue", "") or node_data.get("value", "")
+        literal_hash = self._hash_md5_f32(str(literal_value))
+        features.append(literal_hash)
+        true_length.append(1)
+        
+        # 15. Function modifiers (fixed length via padding)
+        modifiers = node_data.get("func_modifiers", [])
+        modifiers = self._safe_literal_eval(modifiers, default=[])
+        modifier_hashes = []
+        for m in modifiers[:self.max_dfg_modifiers]:
+            # Extract modifier name if it's a dict structure
+            if isinstance(m, dict):
+                mod_name = m.get("name", "") or m.get("modifierName", {}).get("name", "")
+            else:
+                mod_name = str(m)
+            modifier_hashes.append(self._hash_md5_f32(mod_name))
+        
+        if len(modifier_hashes) < self.max_dfg_modifiers:
+            modifier_hashes.extend([0.0] * (self.max_dfg_modifiers - len(modifier_hashes)))
+        features.extend(modifier_hashes)
+        true_length.append(self.max_dfg_modifiers)
+        
+        # 16. Scope hash
+        scope = node_data.get("scope", "")
+        scope_hash = self._hash_md5_f32(str(scope))
+        features.append(scope_hash)
+        true_length.append(1)
+        
+        # 17. Opcode histogram
+        opcode_hist = node_data.get("opcode_hist", {})
+        opcode_hist = self._safe_literal_eval(opcode_hist, default={})
+        op_hist_feat = op_code_histogram_to_feat(opcode_hist)
+        features.extend(op_hist_feat)
+        true_length.append(len(op_hist_feat))
+        
         if not sum(true_length) == self.dfg_node_feat_dim:
             logger.warning(f"DFG Node feature dim mismatch: expected {self.dfg_node_feat_dim}, got {sum(true_length)}")
+            logger.warning(f"Feature breakdown: {list(zip(['node_type', 'contract', 'function', 'var', 'src_len', 'type', 'storage', 'visibility', 'mutability_flags', 'state_mut', 'func_flags', 'operator', 'member', 'literal', 'modifiers', 'scope', 'opcode_hist'], true_length))}")
         
         # Check for vulnerability labels
         node_vulns = node_data.get("node_vulns", [])
@@ -561,40 +776,42 @@ class GraphFeatureExtractor:
         for node_id, node_data in nx_graph.nodes(data=True): # Loop through nodes
             features = []
             features.append(self._hash_md5_f32(str(node_id)))  # Basic hash feature for node ID
+            features_tmp = []
+            
             if graph_type == "cfg":
-                features, vuln_node = self._cfg_node_features(node_data)
+                features_tmp, vuln_node = self._cfg_node_features(node_data)
                 if vuln_node is not None and len(vuln_node) > 0:
                     #print(f"Vulnerable node found in CFG: Node ID {type(node_id)}{node_id} with vuln data {vuln_node}")
                     vuln_nodes[node_id] = vuln_node 
             elif graph_type == "cg":
-                features, vuln_node = self._cg_node_features(node_data)
+                features_tmp, vuln_node = self._cg_node_features(node_data)
                 if vuln_node is not None and len(vuln_node) > 0:
                     #print(f"Vulnerable node found in CG: Node ID {type(node_id)}{node_id} with vuln data {vuln_node}")
                     vuln_nodes[node_id] = vuln_node 
             elif graph_type == "ast":
-                features = self._ast_node_features(node_data)
+                features_tmp = self._ast_node_features(node_data)
             elif graph_type == "dfg":
-                features, vuln_node = self._dfg_node_features(node_data)
+                features_tmp, vuln_node = self._dfg_node_features(node_data)
                 if vuln_node is not None and len(vuln_node) > 0:
                     #print(f"Vulnerable node found in DFG: Node ID {type(node_id)}{node_id} with vuln data {vuln_node}")
                     vuln_nodes[node_id] = vuln_node
             elif graph_type == "creation_cfg":
-                features = self._creation_cfg_node_features(node_data)
+                features_tmp = self._creation_cfg_node_features(node_data)
             elif graph_type == "runtime_cfg":
-                features = self._runtime_cfg_node_features(node_data)
+                features_tmp = self._runtime_cfg_node_features(node_data)
             else:
                 # Placeholder for other graph types
                 if graph_type == "cfg":
-                    features = [0.0] * self.cfg_node_feat_dim
+                    features_tmp = [0.0] * self.cfg_node_feat_dim
                 elif graph_type == "cg":
-                    features = [0.0] * self.cg_node_feat_dim
+                    features_tmp = [0.0] * self.cg_node_feat_dim
                 elif graph_type == "ast":
-                    features = [0.0] * self.ast_node_feat_dim
+                    features_tmp = [0.0] * self.ast_node_feat_dim
                 elif graph_type == "dfg":
-                    features = [0.0] * self.dfg_node_feat_dim
+                    features_tmp = [0.0] * self.dfg_node_feat_dim
                 else:
-                    features = [0.0] * self.cfg_node_feat_dim
-
+                    features_tmp = [0.0] * self.cfg_node_feat_dim
+            features.extend(features_tmp)
             node_key = (graph_type, str(node_id))
             #print(f"Node Key: {node_key}, Features Length: {features}")
             node_features[node_key] = torch.tensor(features, dtype=self.dtype)
@@ -666,21 +883,22 @@ class GraphFeatureExtractor:
     
     def _dfg_edge_features(self, edge_data):
         # DFG EDGE DATA STRUCTURE (from e_4generate_enrichDFG.py):
+        # Enhanced structure with detailed flow tracking:
         # {
         #     "src_id": src_id,
         #     "dst_id": dst_id,
-        #     "edge_type": edge_type,  # e.g., "init", "assign", "var-read", "call-arg", "return", "member", "index-base", "index-idx"
+        #     "edge_type": edge_type,  # e.g., "init", "assign", "var-read", "var-write", "call-arg", "return", "member", "index-base", "index-idx"
         #     "flow": flow_key,        # Machine-readable flow type: "init_to_var", "rhs_to_lhs", "decl_to_use", etc.
         #     "flow_label": flow_label, # Human-readable flow description
         #     "src_var": src_var,      # Source variable name
         #     "dst_var": dst_var,      # Destination variable name
-        #     "contract": contract,
-        #     "function": function,
+        #     "contract_name": contract_name,
+        #     "function_name": function_name,
         #     "frequency": frequency,  # Edge frequency count
-        #     "src_offset": src_offset,  # Optional source location
-        #     "src_length": src_length,
-        #     "src_file": src_file,
-        #     "operator": operator,    # For binary operations (assign edges)
+        #     "src_offset": src_offset,  # Source location offset
+        #     "src_length": src_length,  # Source location length
+        #     "src_file": src_file,      # Source file index
+        #     "operator": operator,    # For binary operations (assign edges) - e.g., "=", "+="
         #     "is_external_call": is_external_call  # Boolean flag (only on call-arg edges)
         # }
         true_length = []
@@ -693,30 +911,56 @@ class GraphFeatureExtractor:
         true_length.append(len(edge_type_oh))
         
         # 2. Flow label one-hot encoding (from DFG_FLOW_LABELS: 13 types)
+        # This captures the semantic relationship: init_to_var, rhs_to_lhs, decl_to_use, etc.
         flow = edge_data.get("flow", "")
         flow_oh = edge_type_to_one_hot(flow, DFG_FLOW_LABELS)
         features.extend(flow_oh)
         true_length.append(len(flow_oh))
 
-        # 3. Frequency feature
+        # 3. Frequency feature (how many times this edge appears)
         features.append(float(edge_data.get("frequency", 1.0)))
         true_length.append(1)
         
-        # 6. Source variable hash
+        # 4. Source variable hash
         src_var = edge_data.get("src_var", "")
         src_var_hash = self._hash_md5_f32(str(src_var) if src_var is not None else "")
         features.append(src_var_hash)
         true_length.append(1)
         
-        # 7. Destination variable hash
+        # 5. Destination variable hash
         dst_var = edge_data.get("dst_var", "")
         dst_var_hash = self._hash_md5_f32(str(dst_var) if dst_var is not None else "")
         features.append(dst_var_hash)
         true_length.append(1)
         
-
+        # 6. Operator hash (for assignment edges)
+        # Captures operators like "=", "+=", "-=", "*=", "/="
+        operator = edge_data.get("operator", "")
+        operator_hash = self._hash_md5_f32(str(operator) if operator else "")
+        features.append(operator_hash)
+        true_length.append(1)
+        
+        # 7. Contract name hash
+        contract_name = edge_data.get("contract_name", "") or edge_data.get("contract", "")
+        contract_hash = self._hash_md5_f32(str(contract_name) if contract_name else "")
+        features.append(contract_hash)
+        true_length.append(1)
+        
+        # 8. Function name hash
+        function_name = edge_data.get("function_name", "") or edge_data.get("function", "")
+        function_hash = self._hash_md5_f32(str(function_name) if function_name else "")
+        features.append(function_hash)
+        true_length.append(1)
+        
+        # 11. Is external call flag (for call-arg edges)
+        is_external_call = edge_data.get("is_external_call", False)
+        is_external_call = self._safe_literal_eval(is_external_call, default=False)
+        features.append(float(is_external_call))
+        true_length.append(1)
+        
         if not sum(true_length) == self.dfg_edge_feat_dim:
-            logger.warning(f"DFG Edge feature dim mismatch: expected {sum(true_length)}, got {self.dfg_edge_feat_dim}")
+            logger.warning(f"DFG Edge feature dim mismatch: expected {self.dfg_edge_feat_dim}, got {sum(true_length)}")
+            logger.warning(f"Feature breakdown: {list(zip(['edge_type', 'flow', 'frequency', 'src_var', 'dst_var', 'operator', 'contract', 'function', 'src_offset', 'src_length', 'is_external_call'], true_length))}")
         return features
     
     def _creation_cfg_edge_features(self, edge_data):
@@ -734,7 +978,7 @@ class GraphFeatureExtractor:
             features = []
             features.extend([self._hash_md5_f32(src),self._hash_md5_f32(dst)])
             if graph_type == "cfg":
-                features= self._cfg_edge_features(edge_data)
+                features = self._cfg_edge_features(edge_data)
                 if vuln_nodes is not None and len(vuln_nodes) > 0:
                     x = vuln_nodes.get(src)
                     y = vuln_nodes.get(dst)
@@ -880,23 +1124,23 @@ class GraphFeatureExtractor:
             # Map func_name -> list of CFG block nodes
             # (e.g., "MyContract.myFunc(uint)" -> [1, 2, 3])
             cfg_func_to_nodes = defaultdict(list)
-
-            for node_id, node_data in nx_cfg.nodes(data=True):
-                contract_name = node_data.get("contract_name")
-                func_name = node_data.get("func_name")
-                if func_name and contract_name:
-                    cfg_func_to_nodes[(contract_name, func_name)].append(node_id)
+            if nx_cfg:
+                for node_id, node_data in nx_cfg.nodes(data=True):
+                    contract_name = node_data.get("contract_name")
+                    func_name = node_data.get("func_name")
+                    if func_name and contract_name:
+                        cfg_func_to_nodes[(contract_name, func_name)].append(node_id)
             
-            # Map func_name -> AST function_definition node
+            # Map func_name -> AST functiondefinition node
             # (e.g., "MyContract.myFunc(uint)" -> "Func_f_123")
             ast_func_to_node = defaultdict(list)
-
-            for node_id, node_data in nx_ast.nodes(data=True):
-                if node_data.get("node_type") == "function_definition":
-                    func_name = node_data.get("function_name")
-                    contract_name = node_data.get("contract_name")
-                    if func_name and contract_name:
-                        ast_func_to_node[(contract_name, func_name)] = node_id
+            if nx_ast:
+                for node_id, node_data in nx_ast.nodes(data=True):
+                    if node_data.get("node_type").lower() == "functiondefinition":
+                        func_name = node_data.get("function_name")
+                        contract_name = node_data.get("contract_name")
+                        if func_name and contract_name:
+                            ast_func_to_node[(contract_name, func_name)] = node_id
 
             dfg_func_to_nodes = defaultdict(list)
             if nx_dfg:
@@ -904,9 +1148,8 @@ class GraphFeatureExtractor:
                     func_name = node_data.get("function_name")
                     contract_name = node_data.get("contract_name")
                     if func_name and contract_name:
-                        if (contract_name, func_name) not in dfg_func_to_nodes:
-                            dfg_func_to_nodes[(contract_name, func_name)] = []
                         dfg_func_to_nodes[(contract_name, func_name)].append(node_id)
+
 
             # --- 4. Initialize `data_dict` for DGL ---
             data_dict = {}
@@ -920,28 +1163,28 @@ class GraphFeatureExtractor:
                     cg_src.append(cg_node_to_id[src])
                     cg_dst.append(cg_node_to_id[dst])
                     cg_efeat.append(cg_edge_features[("cg", str(src), str(dst))])
-            if cg_src:
-                data_dict[('function', 'calls', 'function')] = (torch.tensor(cg_src, dtype=self.int_dtype), torch.tensor(cg_dst, dtype=self.int_dtype))
+            data_dict[('function', 'calls', 'function')] = (torch.tensor(cg_src, dtype=self.int_dtype), torch.tensor(cg_dst, dtype=self.int_dtype))
 
             # CFG def ('block', 'flows', 'block')
             cfg_src, cfg_dst, cfg_efeat = [], [], []
-            for src, dst in nx_cfg.edges():
-                if src in cfg_node_to_id and dst in cfg_node_to_id:
-                    cfg_src.append(cfg_node_to_id[src])
-                    cfg_dst.append(cfg_node_to_id[dst])
-                    cfg_efeat.append(cfg_edge_features[("cfg", str(src), str(dst))])
-            if cfg_src:
-                data_dict[('block', 'flows', 'block')] = (torch.tensor(cfg_src, dtype=self.int_dtype), torch.tensor(cfg_dst, dtype=self.int_dtype))
+            if nx_cfg:
+                for src, dst in nx_cfg.edges():
+                    if src in cfg_node_to_id and dst in cfg_node_to_id:
+                        cfg_src.append(cfg_node_to_id[src])
+                        cfg_dst.append(cfg_node_to_id[dst])
+                        cfg_efeat.append(cfg_edge_features[("cfg", str(src), str(dst))])
+
+            data_dict[('block', 'flows', 'block')] = (torch.tensor(cfg_src, dtype=self.int_dtype), torch.tensor(cfg_dst, dtype=self.int_dtype))
 
             # AST def ('ast_node', 'child_of', 'ast_node')
             ast_src, ast_dst, ast_efeat = [], [], []
-            for src, dst in nx_ast.edges():
-                if src in ast_node_to_id and dst in ast_node_to_id:
-                    ast_src.append(ast_node_to_id[src])
-                    ast_dst.append(ast_node_to_id[dst])
-                    ast_efeat.append(ast_edge_features[("ast", str(src), str(dst))])
-            if ast_src:
-                data_dict[('ast_node', 'child_of', 'ast_node')] = (torch.tensor(ast_src, dtype=self.int_dtype), torch.tensor(ast_dst, dtype=self.int_dtype))
+            if nx_ast:
+                for src, dst in nx_ast.edges():
+                    if src in ast_node_to_id and dst in ast_node_to_id:
+                        ast_src.append(ast_node_to_id[src])
+                        ast_dst.append(ast_node_to_id[dst])
+                        ast_efeat.append(ast_edge_features[("ast", str(src), str(dst))])
+            data_dict[('ast_node', 'child_of', 'ast_node')] = (torch.tensor(ast_src, dtype=self.int_dtype), torch.tensor(ast_dst, dtype=self.int_dtype))
 
             # DFG def ('dfg_node', 'data_flow', 'dfg_node')
             dfg_src, dfg_dst, dfg_efeat = [], [], []
@@ -951,8 +1194,7 @@ class GraphFeatureExtractor:
                         dfg_src.append(dfg_node_to_id[src])
                         dfg_dst.append(dfg_node_to_id[dst])
                         dfg_efeat.append(dfg_edge_features[("dfg", str(src), str(dst))])
-                if dfg_src:
-                    data_dict[('dfg_node', 'data_flow', 'dfg_node')] = (torch.tensor(dfg_src, dtype=self.int_dtype), torch.tensor(dfg_dst, dtype=self.int_dtype))
+            data_dict[('dfg_node', 'data_flow', 'dfg_node')] = (torch.tensor(dfg_src, dtype=self.int_dtype), torch.tensor(dfg_dst, dtype=self.int_dtype))
 
             # --- 6. Process NEW Linking Edges (The "additional edges") ---
             link_func_block_src, link_func_block_dst = [], []
@@ -1000,47 +1242,100 @@ class GraphFeatureExtractor:
                             link_ast_func_dst.append(cg_node_id)
 
                 # C. Link CFG 'block' -> DFG 'dfg_node' (One-to-Many)
-                if nx_cfg and nx_dfg:
-                    cfg_key = (contract_name, func_name)
-                    if cfg_key in cfg_func_to_nodes:
-                        for cfg_node_str in cfg_func_to_nodes[cfg_key]:
-                            if cfg_node_str in cfg_node_to_id: # Ensure block node exists
-                                cfg_node_id = cfg_node_to_id[cfg_node_str]
+                # C. Link 'block' -> 'dfg_node' (based on 'src' containment)
+            if nx_cfg and nx_dfg:
+                cfg_key = (contract_name, func_name)
+                dfg_key = (contract_name, func_name)
+
+                # Check if both graphs have nodes for this function
+                if cfg_key in cfg_func_to_nodes and dfg_key in dfg_func_to_nodes:
+                    
+                    # Iterate through all CFG blocks for this function
+                    for cfg_node_str in cfg_func_to_nodes[cfg_key]:
+                        if cfg_node_str not in cfg_node_to_id:
+                            continue
+                        cfg_node_id = cfg_node_to_id[cfg_node_str]
+                        
+                        # Safely evaluate the src attribute for the CFG block
+                        cfg_src_raw = nx_cfg.nodes[cfg_node_str].get("code_lines")
+                        cfg_src = self._safe_literal_eval(cfg_src_raw, default=None)
+
+                        # Skip block if its src is not a valid [start, end] pair
+                        if not (isinstance(cfg_src, list) and len(cfg_src) == 2):
+                            continue  
+                        
+                        try:
+                            cfg_start, cfg_end = float(cfg_src[0]), float(cfg_src[1])
+                        except (ValueError, TypeError):
+                            continue # Skip if src values aren't numeric
+
+                        # Iterate through all DFG nodes for this function
+                        for dfg_node_str in dfg_func_to_nodes[dfg_key]:
+                            if dfg_node_str not in dfg_node_to_id:
+                                continue
+                            dfg_node_id = dfg_node_to_id[dfg_node_str]
+                            
+                            # Safely evaluate the src attribute for the DFG node
+                            dfg_src_raw = nx_dfg.nodes[dfg_node_str].get("code_lines")
+                            dfg_src = self._safe_literal_eval(dfg_src_raw, default=None)
+                            
+                            # Skip DFG node if its src is not valid
+                            if not (isinstance(dfg_src, list) and len(dfg_src) == 2):
+                                continue 
+                            
+                            try:
+                                dfg_start, dfg_end = float(dfg_src[0]), float(dfg_src[1])
+                            except (ValueError, TypeError):
+                                continue # Skip if src values aren't numeric
+
+                            # --- THE KEY: LINK CONDITION ---
+                            # Link if the block's range CONTAINS the DFG node's range.
+                            if (cfg_start <= dfg_start) and (cfg_end >= dfg_end):
+                                link_block_dfg_src.append(cfg_node_id)
+                                link_block_dfg_dst.append(dfg_node_id)
                                 
-                                # Link to corresponding DFG nodes for this function
-                                dfg_key = (contract_name, func_name)
-                                if dfg_key in dfg_func_to_nodes:
-                                    for dfg_node_str in dfg_func_to_nodes[dfg_key]:
-                                        if dfg_node_str in dfg_node_to_id: # Ensure DFG node exists
-                                            dfg_node_id = dfg_node_to_id[dfg_node_str]
-                                            
-                                            link_block_dfg_src.append(cfg_node_id)
-                                            link_block_dfg_dst.append(dfg_node_id)
-                                            
-                                            link_dfg_block_src.append(dfg_node_id)
-                                            link_dfg_block_dst.append(cfg_node_id)
+                                link_dfg_block_src.append(dfg_node_id)
+                                link_dfg_block_dst.append(cfg_node_id)
             
-            if nx_cfg and link_func_block_src:
-                data_dict[('function', 'has_block', 'block')] = (torch.tensor(link_func_block_src, dtype=self.int_dtype), torch.tensor(link_func_block_dst, dtype=self.int_dtype))
-                data_dict[('block', 'part_of_func', 'function')] = (torch.tensor(link_block_func_src, dtype=self.int_dtype), torch.tensor(link_block_func_dst, dtype=self.int_dtype))
+            data_dict[('function', 'has_block', 'block')] = (torch.tensor(link_func_block_src, dtype=self.int_dtype), torch.tensor(link_func_block_dst, dtype=self.int_dtype))
+            data_dict[('block', 'part_of_func', 'function')] = (torch.tensor(link_block_func_src, dtype=self.int_dtype), torch.tensor(link_block_func_dst, dtype=self.int_dtype))
+
+            data_dict[('function', 'defines_ast', 'ast_node')] = (torch.tensor(link_func_ast_src, dtype=self.int_dtype), torch.tensor(link_func_ast_dst, dtype=self.int_dtype))
+            data_dict[('ast_node', 'defined_by_func', 'function')] = (torch.tensor(link_ast_func_src, dtype=self.int_dtype), torch.tensor(link_ast_func_dst, dtype=self.int_dtype))
+
+            data_dict[('block', 'related_dfg', 'dfg_node')] = (torch.tensor(link_block_dfg_src, dtype=self.int_dtype), torch.tensor(link_block_dfg_dst, dtype=self.int_dtype))
+            data_dict[('dfg_node', 'related_block', 'block')] = (torch.tensor(link_dfg_block_src, dtype=self.int_dtype), torch.tensor(link_dfg_block_dst, dtype=self.int_dtype))
+
+            # --- VALIDATION: Check edge consistency BEFORE creating DGL graph ---
+            num_nodes_dict = {
+                'function': len(cg_nodes),
+                'block': len(cfg_nodes) if nx_cfg else 0,
+                'ast_node': len(ast_nodes) if nx_ast else 0,
+                'dfg_node': len(dfg_nodes) if nx_dfg else 0
+            }
             
-            if nx_ast and link_func_ast_src:
-
-                data_dict[('function', 'defines_ast', 'ast_node')] = (torch.tensor(link_func_ast_src, dtype=self.int_dtype), torch.tensor(link_func_ast_dst, dtype=self.int_dtype))
-                data_dict[('ast_node', 'defined_by_func', 'function')] = (torch.tensor(link_ast_func_src, dtype=self.int_dtype), torch.tensor(link_ast_func_dst, dtype=self.int_dtype))
-
-            if nx_dfg and link_block_dfg_src:
-                data_dict[('block', 'related_dfg', 'dfg_node')] = (torch.tensor(link_block_dfg_src, dtype=self.int_dtype), torch.tensor(link_block_dfg_dst, dtype=self.int_dtype))
-                data_dict[('dfg_node', 'related_block', 'block')] = (torch.tensor(link_dfg_block_src, dtype=self.int_dtype), torch.tensor(link_dfg_block_dst, dtype=self.int_dtype))
+            # Validate that all edges reference valid node IDs
+            for etype, (src_ids, dst_ids) in data_dict.items():
+                src_type, _, dst_type = etype
+                src_tensor = src_ids if isinstance(src_ids, torch.Tensor) else torch.tensor(src_ids)
+                dst_tensor = dst_ids if isinstance(dst_ids, torch.Tensor) else torch.tensor(dst_ids)
+                
+                if len(src_tensor) > 0:
+                    max_src = src_tensor.max().item()
+                    max_dst = dst_tensor.max().item()
+                    
+                    if max_src >= num_nodes_dict[src_type]:
+                        logger.error(f"Edge type {etype}: source node ID {max_src} >= num {src_type} nodes ({num_nodes_dict[src_type]})")
+                        logger.error(f"Project: {project_name}")
+                        raise ValueError(f"Invalid edge: source node {max_src} out of range for type {src_type}")
+                    
+                    if max_dst >= num_nodes_dict[dst_type]:
+                        logger.error(f"Edge type {etype}: dest node ID {max_dst} >= num {dst_type} nodes ({num_nodes_dict[dst_type]})")
+                        logger.error(f"Project: {project_name}")
+                        raise ValueError(f"Invalid edge: dest node {max_dst} out of range for type {dst_type}")
 
             # --- 7. Create DGL Heterograph ---
-            g = dgl.heterograph(data_dict, 
-                                num_nodes_dict={
-                                    'function': len(cg_nodes),
-                                    'block': len(cfg_nodes) if nx_cfg else 0,
-                                    'ast_node': len(ast_nodes) if nx_ast else 0,
-                                    'dfg_node': len(dfg_nodes) if nx_dfg else 0
-                                })
+            g = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict)
             
             # --- 8. Assign Node Features --- 
             # We must stack the features in the *exact* order of the sorted node lists.
@@ -1067,20 +1362,26 @@ class GraphFeatureExtractor:
             # Their structure is the feature.
 
             # --- 10. Vulnerability Labels ---
-            # For nodes without vulnerability labels, create zero vectors
+            # For nodes without vulnerability labels, create benign label (all zeros - no vulnerabilities)
+            # Helper function to create benign label
+            def create_benign_label():
+                """Create a benign label vector: all zeros (no vulnerabilities = benign)"""
+                benign = torch.zeros(len(OWASP_VULN), dtype=self.dtype)
+                return benign
+            
             cg_vuln_tensors = []
             for n in cg_nodes:
                 if n in cg_vuln_labels:
                     cg_vuln_tensors.append(torch.tensor(cg_vuln_labels[n], dtype=self.dtype))
                 else:
-                    cg_vuln_tensors.append(torch.zeros(len(OWASP_VULN), dtype=self.dtype))
+                    cg_vuln_tensors.append(create_benign_label())
             
             cfg_vuln_tensors = []
             for n in cfg_nodes:
                 if n in cfg_vuln_labels:
                     cfg_vuln_tensors.append(torch.tensor(cfg_vuln_labels[n], dtype=self.dtype))
                 else:
-                    cfg_vuln_tensors.append(torch.zeros(len(OWASP_VULN), dtype=self.dtype))
+                    cfg_vuln_tensors.append(create_benign_label())
             
             dfg_vuln_tensors = []
             if nx_dfg and dfg_nodes:
@@ -1088,7 +1389,7 @@ class GraphFeatureExtractor:
                     if n in dfg_vuln_labels:
                         dfg_vuln_tensors.append(torch.tensor(dfg_vuln_labels[n], dtype=self.dtype))
                     else:
-                        dfg_vuln_tensors.append(torch.zeros(len(OWASP_VULN), dtype=self.dtype))
+                        dfg_vuln_tensors.append(create_benign_label())
             # AST nodes don't have vuln labels, so we can skip
             #g.nodes['ast_node'].data['vuln'] = torch.zeros((len(ast_nodes), len(OWASP_VULN)), dtype=self.dtype)
 

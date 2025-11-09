@@ -89,10 +89,10 @@ The simplified pipeline maintains feature compatibility while being practical fo
 
 try:
     from experiments.models.baseline3 import CombinedModel
-    from experiments.utils.logger import setup_logger
+    from experiments.the_utils.logger import setup_logger
 except ImportError as e:
     from experiments.models.baseline3 import CombinedModel
-    from utils.logger import setup_logger
+    from the_utils.logger import setup_logger
 
 import networkx as nx
 import pydot

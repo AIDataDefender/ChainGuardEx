@@ -8,7 +8,7 @@ from typing import Dict, Tuple, Optional, List
 import logging
 import traceback
 
-from experiments.utils.logger import setup_logger
+from experiments.the_utils.logger import setup_logger
 
 os.makedirs("Logs", exist_ok=True)
 logger = setup_logger("Logs/gat_model.log")

@@ -12,14 +12,15 @@ import warnings
 
 from transformers import AutoModel, AutoTokenizer
 try:
-    from experiments.utils.graph_utils import vuln_to_label, OWASP_VULN
-    from experiments.utils.logger import setup_logger
+    from experiments.the_utils.graph_utils import vuln_to_label, OWASP_VULN
+    from experiments.the_utils.logger import setup_logger
 except ImportError:
-    from utils.graph_utils import vuln_to_label, OWASP_VULN
-    from utils.logger import setup_logger
+    from the_utils.graph_utils import vuln_to_label, OWASP_VULN
+    from the_utils.logger import setup_logger
 
-os.makedirs("Logs", exist_ok=True)
-logger = setup_logger("Logs/raw_code_processing.log")
+log_folder = os.getenv('LOG_FOLDER', 'Logs')
+os.makedirs(log_folder, exist_ok=True)
+logger = setup_logger(f"{log_folder}/raw_code_processing.log")
 
 
 class RawCodeFeatureExtractor:
@@ -51,10 +52,14 @@ class RawCodeFeatureExtractor:
         }
         #################################
         self.dtype = torch.float32  # Default data type for tensors
-        self.model.eval()  # Set model to evaluation mode
-        self.model.to(self.device)
-        # Use the tokenizer's own separator token; don't force-add a new token that the model can't embed
-        self.sep_token = getattr(self.tokenizer, 'sep_token', None) or '</s>'
+        if model or tokenizer:
+            self.model.eval()  # Set model to evaluation mode
+            self.model.to(self.device)
+            # Use the tokenizer's own separator token; don't force-add a new token that the model can't embed
+            self.sep_token = getattr(self.tokenizer, 'sep_token', None) or '</s>'
+        else:
+            logger.warning("ON non-processing mode !")
+        
         
     def fetch_all_feat_dim(self):
         return {
@@ -139,8 +144,7 @@ class RawCodeFeatureExtractor:
                     padding=True,
                     truncation=True,
                     max_length=self.max_length,
-                    return_tensors="pt",
-
+                    return_tensors="pt"
                 ).to(self.device)
                 
                 # Track token dimensions if enabled
@@ -219,8 +223,6 @@ class RawCodeFeatureExtractor:
         for _, row in df.iterrows():
             # Support either 'vuln_id' or fallback to 'vuln' column
             vuln_field = row.get('vuln_id', None)
-            if vuln_field is None and 'vuln' in row:
-                vuln_field = row.get('vuln', None)
             if isinstance(vuln_field, str) and pd.notna(vuln_field) and vuln_field.strip():
                 vuln_vec = vuln_to_label(vuln_field.split(';'))
             else:
@@ -255,7 +257,7 @@ class RawCodeFeatureExtractor:
                 
                 logger.info(f"Dataframe {project_name} completed successfully!")
                 logger.info(f"Statistics: {json.dumps(self.stats, indent=2)}")
-            
+                results.append((project_name, {'features': features, 'labels': labels}))
             logger.info(f"Pipeline completed! Processed {len(results)} dataframes")
             return results
         except Exception as e:
