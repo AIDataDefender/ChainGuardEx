@@ -260,157 +260,30 @@ CALL_OPCODE = [
     "CROSS_CONTRACT",         # destination in another contract
 ]
 
-
-def get_all_list_lengths() -> Dict[str, int]:
-    """Return lengths of the constant lists so callers (eg. GraphFeatureExtractor)
-    can compute feature dimensions dynamically.
-    """
-    return {
-        'OWASP_VULN': len(OWASP_VULN),
-        'VAR_VISIBILITY': len(VAR_VISIBILITY),
-        'FUNC_VISIBILITY': len(FUNC_VISIBILITY),
-        'VAR_STORAGE': len(VAR_STORAGE),
-        'STATE_MUTABILITY': len(STATE_MUTABILITY),
-        'EVENT_META': len(EVENT_META),
-        'OPCODE_HIST': len(OPCODE_HIST),
-        'CFG_NODE_TYPE_LIST': len(CFG_NODE_TYPE_LIST),
-        'CG_NODE_TYPE_LIST': len(CG_NODE_TYPE_LIST),
-        'AST_NODE_TYPE_LIST': len(AST_NODE_TYPE_LIST),
-        # 'DFG_NODE_TYPE_LIST': len(DFG_NODE_TYPE_LIST),
-        'CFG_EDGE_TYPES': len(CFG_EDGE_TYPES),
-        'CG_EDGE_TYPES': len(CG_EDGE_TYPES),
-        'AST_EDGE_TYPES': len(AST_EDGE_TYPES),
-        'DFG_EDGE_TYPES': len(DFG_EDGE_TYPES),
-        'CONTRACT_KIND': len(CONTRACT_KIND),
-        'MODIFIERS': len(MODIFIERS),
-        'OPCODE_VOCAB': len(OPCODE_VOCAB),
-    }
-
 #############################################################
 # region Vectors
 #############################################################
 
 
-def vuln_to_label(owasp_list):
-    """
-    Convert OWASP vulnerability list to multi-hot label vector.
-    
-    For multilabel classification with 8 vulnerability types:
-    - If owasp_list is None/empty: returns all zeros (benign = no vulnerabilities)
-    - Otherwise: sets corresponding vulnerability indices to 1.0
-    
-    Args:
-        owasp_list: List of OWASP vulnerability IDs (e.g., ['SC01:2025', 'SC03:2025'])
-    
-    Returns:
-        List of floats (length = 8) with 1.0 for present vulnerabilities, 0.0 otherwise
-    """
-    labels = [0.0] * len(OWASP_VULN)  # Initialize all to 0.0
-    
-    # Case 1: No vulnerabilities - return all zeros (benign)
+def vuln_to_label(owasp_list: List[str] | None) -> List[float]:
+    """Convert a list of OWASP IDs into a multi-hot label vector."""
+    labels = [0.0] * len(OWASP_VULN)
     if not owasp_list:
         return labels
-    
-    # Case 2: Has vulnerabilities - set corresponding indices
+
     found_any = False
-    for owasp in (owasp_list or []):
+    for owasp in owasp_list:
         key = str(owasp).upper().strip()
-        
         if key in OWASP_VULN:
-            idx = OWASP_VULN.index(key)
-            labels[idx] = 1.0
+            labels[OWASP_VULN.index(key)] = 1.0
             found_any = True
         else:
-            # WARNING: Unknown vulnerability ID - not in OWASP_VULN list
             print(f"vuln_to_label: Unknown vulnerability '{key}' not in OWASP_VULN list")
-    
-    # SANITY CHECK: If we had a list but found nothing, log warning
+
     if not found_any and owasp_list:
         print(f"vuln_to_label: Had vulnerability list {owasp_list} but no matches found!")
-    
+
     return labels
-
-def op_code_histogram_to_feat(opcode_hist : Dict):
-        
-    # Use module-level OPCODE_HIST list defined above
-    # produce a simple vector counts aligned with OPCODE_HIST
-    op_hist_vector = [0.0] * len(OPCODE_HIST)
-    if not opcode_hist:
-        return op_hist_vector
-    for i, k in enumerate(OPCODE_HIST):
-        # opcode_hist may contain counts keyed by opcode-like strings
-        op_hist_vector[i] = float(opcode_hist.get(k, 0))
-    return op_hist_vector
-    
-def call_opcode_to_feat(call_opcodes: List):
-    call_op_vec = [0.0] * len(CALL_OPCODE)
-    if not call_opcodes:
-        return call_op_vec  
-    for co in call_opcodes:
-        c = co.upper()
-        if c in CALL_OPCODE:
-            call_op_vec[CALL_OPCODE.index(c)] += 1.0
-    return call_op_vec
-
-
-
-#############################################################
-# region One-hot 
-#############################################################
-
-def var_visibility_to_one_hot(vis:str):
-    one_hot = [0.0] * len(VAR_VISIBILITY)
-    if not vis:
-        return one_hot
-    v = vis.lower()
-    if v in VAR_VISIBILITY:
-        one_hot[VAR_VISIBILITY.index(v)] = 1.0
-    return one_hot
-
-def func_visibility_to_one_hot(vis:str):
-    one_hot = [0.0] * len(FUNC_VISIBILITY)
-    if not vis:
-        return one_hot
-    v = vis.lower()
-    if v in FUNC_VISIBILITY:
-        one_hot[FUNC_VISIBILITY.index(v)] = 1.0
-    return one_hot
-
-def var_storage_to_one_hot(storage:str):
-    one_hot = [0.0] * len(VAR_STORAGE)
-    if not storage:
-        return one_hot
-    s = storage.lower()
-    if s in VAR_STORAGE:
-        one_hot[VAR_STORAGE.index(s)] = 1.0
-    return one_hot
-
-def func_stateMutability_to_one_hot(stateMutability:str):
-    one_hot = [0.0] * len(STATE_MUTABILITY)
-    if not stateMutability:
-        return one_hot
-    s = stateMutability.lower()
-    if s in STATE_MUTABILITY:
-        one_hot[STATE_MUTABILITY.index(s)] = 1.0
-    return one_hot
-
-def event_meta_to_one_hot(meta:str):
-    one_hot = [0.0] * len(EVENT_META)
-    if not meta:
-        return one_hot
-    m = meta.lower()
-    if m in EVENT_META:
-        one_hot[EVENT_META.index(m)] = 1.0
-    return one_hot
-
-def contract_kind_to_one_hot(kind:str):
-    one_hot = [0.0] * len(CONTRACT_KIND)
-    if not kind:
-        return one_hot
-    k = kind.lower()
-    if k in CONTRACT_KIND:
-        one_hot[CONTRACT_KIND.index(k)] = 1.0
-    return one_hot
 
 def node_type_to_one_hot(node_type: str, type_list: list) -> list:
     """Encode node type to one-hot vector."""

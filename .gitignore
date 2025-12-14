@@ -19,8 +19,13 @@ Logs
 *.docx
 *.xlsx
 test
-Data
+Data/
 processed_data
 Siamese-model
 .vscode
-.pth
+*.pth
+checkpoints*
+debug*
+save_data
+test_output
+.old
