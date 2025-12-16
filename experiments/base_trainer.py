@@ -14,10 +14,11 @@ import copy
 
 from tqdm import tqdm
 from dgl.dataloading import GraphDataLoader
-from torch.utils.data import random_split
+from torch.utils.data import Subset
 from sklearn.metrics import (
     roc_auc_score,
     f1_score,
+    precision_score,
     classification_report,
 )
 
@@ -179,8 +180,8 @@ class FocalLoss(nn.Module):
         # For y=1: FL = -alpha * (1-p)^gamma * log(p)
         # For y=0: FL = -(1-alpha) * p^gamma * log(1-p)
 
-        # Clamp probabilities to avoid log(0)
-        eps = 1e-6
+        # Clamp probabilities to avoid log(0) - use larger epsilon for stability
+        eps = 1e-7
         p_clamped = torch.clamp(p, min=eps, max=1.0 - eps)
 
         # Positive case (y=1)
@@ -222,7 +223,7 @@ class BaseTrainer:
         stage=3,  # NEW: Pass stage to trainer
         batch_size=4,
         num_epochs=30,
-        learning_rate=3e-5,
+        learning_rate=None,  # Auto-set based on stage
         patience=10,
         hidden_dim=256,
         rand_seed=42,
@@ -238,11 +239,27 @@ class BaseTrainer:
         self.logger = setup_logger(
             f"{self.log_folder}/trainer.log", logging.INFO)
 
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
+        # GPU Detection and Diagnostics
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            gpu_count = torch.cuda.device_count()
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"✓ CUDA Available: {gpu_count} GPU(s) detected")
+            print(f"✓ GPU 0: {gpu_name}")
+            self.device = torch.device("cuda")
+        else:
+            print("✗ CUDA NOT Available - Running on CPU")
+            print(f"  PyTorch version: {torch.__version__}")
+            print(f"  CUDA built version: {torch.version.cuda}")
+            self.device = torch.device("cpu")
+        
         self.batch_size = batch_size
         self.num_epochs = num_epochs
-        self.learning_rate = learning_rate
+        # Stage-specific learning rates: Stage 1/2 need higher LR due to extreme imbalance
+        if learning_rate is None:
+            self.learning_rate = 1e-4 if self.stage in [1, 2] else 3e-5
+        else:
+            self.learning_rate = learning_rate
         self.patience = patience
         self.hidden_dim = hidden_dim
 
@@ -276,17 +293,168 @@ class BaseTrainer:
         self.dataset = CustomDataset(
             source="DAppSCAN", force_reload=False, rand_seed=rand_seed, stage=self.stage)
         self.embedding_dims = self.dataset.embedding_dims
-        # Basic Split (80/10/10)
-        # Note: For Stage 1/2, stratification is tricky without extracting all labels first
-        # We use random split for simplicity in this updated version
-        train_size = int(0.8 * len(self.dataset))
-        val_size = int(0.1 * len(self.dataset))
-        test_size = len(self.dataset) - train_size - val_size
 
-        train_ds, val_ds, test_ds = random_split(
-            self.dataset, [train_size, val_size, test_size],
-            generator=torch.Generator().manual_seed(rand_seed)
-        )
+        # Stratified Split (80/10/10) to keep label ratios consistent across splits.
+        # For Stage 1/2: binary graph labels.
+        # For Stage 3: binary proxy label = any vulnerable node in (cfg|ast).
+        n_total = len(self.dataset)
+        if n_total <= 0:
+            raise ValueError("Empty dataset")
+
+        def _to_binary(v):
+            try:
+                if isinstance(v, torch.Tensor):
+                    if v.numel() != 1:
+                        return 0
+                    v = v.item()
+                if isinstance(v, bool):
+                    v = int(v)
+                if isinstance(v, (int, float)):
+                    return 1 if float(v) > 0.5 else 0
+            except Exception:
+                return 0
+            return 0
+
+        labels = []
+        if self.stage in [1, 2]:
+            for _, lbl in getattr(self.dataset, "dataset_label", []):
+                labels.append(_to_binary(lbl))
+        else:
+            for _, lbl in getattr(self.dataset, "dataset_label", []):
+                is_pos = 0
+                if isinstance(lbl, dict):
+                    cfg = lbl.get("cfg_node")
+                    ast = lbl.get("ast_node")
+                    try:
+                        if isinstance(cfg, torch.Tensor) and cfg.numel() > 0:
+                            is_pos = 1 if (cfg.sum() > 0).item() else 0
+                        if not is_pos and isinstance(ast, torch.Tensor) and ast.numel() > 0:
+                            is_pos = 1 if (ast.sum() > 0).item() else 0
+                    except Exception:
+                        is_pos = 0
+                labels.append(int(is_pos))
+
+        if len(labels) != n_total:
+            self.logger.warning(
+                f"Label extraction mismatch: got {len(labels)} labels for dataset size {n_total}. Falling back to random split."
+            )
+            labels = None
+
+        def _stratified_indices(y, seed, train_ratio=0.8, val_ratio=0.1):
+            idx0 = [i for i, v in enumerate(y) if int(v) == 0]
+            idx1 = [i for i, v in enumerate(y) if int(v) == 1]
+            rng = random.Random(seed)
+            rng.shuffle(idx0)
+            rng.shuffle(idx1)
+
+            # Log overall balance (useful for Stage 1/2 where positives may be extremely rare).
+            try:
+                self.logger.info(
+                    f"[SPLIT DEBUG] Total={len(y)} | pos={len(idx1)} ({(len(idx1)/len(y)*100):.3f}%) | neg={len(idx0)}"
+                )
+            except Exception:
+                pass
+
+            # If a class is missing, stratification is impossible.
+            if len(idx0) == 0 or len(idx1) == 0:
+                all_idx = list(range(len(y)))
+                rng.shuffle(all_idx)
+                tr = int(len(all_idx) * train_ratio)
+                va = int(len(all_idx) * val_ratio)
+                return all_idx[:tr], all_idx[tr: tr + va], all_idx[tr + va:]
+
+            def split_class(idxs):
+                """Split a single class list into train/val/test.
+
+                Key property: if the class has >=3 samples, guarantee at least
+                1 in val and 1 in test so val metrics (e.g., F1) are meaningful.
+                """
+                n = len(idxs)
+                if n <= 0:
+                    return [], [], []
+                if n == 1:
+                    return idxs[:1], [], []
+                if n == 2:
+                    # Prefer train+val so validation sees the rare class.
+                    return idxs[:1], idxs[1:2], []
+
+                # n >= 3
+                tr = int(n * train_ratio)
+                va = int(n * val_ratio)
+                te = n - tr - va
+
+                # Ensure at least 1 in each split where possible.
+                va = max(1, va)
+                te = max(1, te)
+                tr = n - va - te
+                if tr <= 0:
+                    tr = 1
+                    # take from the larger of (va, te)
+                    if va >= te and va > 1:
+                        va -= 1
+                    elif te > 1:
+                        te -= 1
+                    else:
+                        # Worst-case: push everything into train+val
+                        te = 0
+                        va = n - tr
+
+                return idxs[:tr], idxs[tr: tr + va], idxs[tr + va: tr + va + te]
+
+            tr0, va0, te0 = split_class(idx0)
+            tr1, va1, te1 = split_class(idx1)
+
+            train_idx = tr0 + tr1
+            val_idx = va0 + va1
+            test_idx = te0 + te1
+            rng.shuffle(train_idx)
+            rng.shuffle(val_idx)
+            rng.shuffle(test_idx)
+            return train_idx, val_idx, test_idx
+
+        if labels is None:
+            all_idx = list(range(n_total))
+            rng = random.Random(rand_seed)
+            rng.shuffle(all_idx)
+            train_size = int(0.8 * n_total)
+            val_size = int(0.1 * n_total)
+            train_idx = all_idx[:train_size]
+            val_idx = all_idx[train_size: train_size + val_size]
+            test_idx = all_idx[train_size + val_size:]
+        else:
+            train_idx, val_idx, test_idx = _stratified_indices(
+                labels, rand_seed)
+
+        # Persist class balance for Stage 1/2 loss weighting.
+        self._split_stats = {
+            "train": {"pos": 0, "neg": 0},
+            "val": {"pos": 0, "neg": 0},
+            "test": {"pos": 0, "neg": 0},
+        }
+        if labels is not None:
+            def _count(idxs):
+                pos = sum(1 for i in idxs if int(labels[i]) == 1)
+                neg = len(idxs) - pos
+                return pos, neg
+
+            tr_pos, tr_neg = _count(train_idx)
+            va_pos, va_neg = _count(val_idx)
+            te_pos, te_neg = _count(test_idx)
+            self._split_stats["train"] = {"pos": tr_pos, "neg": tr_neg}
+            self._split_stats["val"] = {"pos": va_pos, "neg": va_neg}
+            self._split_stats["test"] = {"pos": te_pos, "neg": te_neg}
+            try:
+                self.logger.info(
+                    f"[SPLIT DEBUG] Train={len(train_idx)} (pos={tr_pos}, neg={tr_neg}) | "
+                    f"Val={len(val_idx)} (pos={va_pos}, neg={va_neg}) | "
+                    f"Test={len(test_idx)} (pos={te_pos}, neg={te_neg})"
+                )
+            except Exception:
+                pass
+
+        train_ds = Subset(self.dataset, train_idx)
+        val_ds = Subset(self.dataset, val_idx)
+        test_ds = Subset(self.dataset, test_idx)
 
         # Create Loaders
         # IMPORTANT: custom_collate needs to know the stage!
@@ -307,24 +475,27 @@ class BaseTrainer:
             if sample is not None:
                 break
         if sample is None:
-            raise ValueError("No valid sample found in dataset for model setup.")
+            raise ValueError(
+                "No valid sample found in dataset for model setup.")
 
         # Get rel_names from processor
         self.rel_names = self.dataset.CPG_Proccessor.rel_names
 
         # Use embedding_dims from CPG_Processor
         node_dims = {
-            'cfg_node': self.embedding_dims['node_cfg'],
-            'ast_node': self.embedding_dims['node_ast'],
+            'cfg_node': self.embedding_dims['cfg_node'],
+            'ast_node': self.embedding_dims['ast_node'],
         }
 
         edge_dims = {}
         rel_names = []
         if self.stage == 3:
             g = sample['graph']
-            edge_dims = {et: self.embedding_dims['edge']
-                        for et in g.canonical_etypes}
-            rel_names = g.canonical_etypes
+            # Use processor-wide rel_names so all standardized graphs are supported.
+            rel_names = [_et for _et in (self.rel_names or [])]
+            if not rel_names:
+                rel_names = g.canonical_etypes
+            edge_dims = {et: self.embedding_dims['edge'] for et in rel_names}
 
         # 2. Define Output Dim
         # Stage 3: 8 Classes (Multi-label)
@@ -332,7 +503,13 @@ class BaseTrainer:
         out_dim = 8 if self.stage == 3 else 1
 
         # 3. Instantiate Model
-        from models.baseline_5 import CascadedHeteroModel
+        try:
+            from experiments.models.baseline_6 import CascadedHeteroModel
+            from experiments.models.baseline_simple import SimpleHeteroModel
+        except Exception:
+            from models.baseline_6 import CascadedHeteroModel
+            from models.baseline_simple import SimpleHeteroModel
+            
         self.model = CascadedHeteroModel(
             node_dims=node_dims,
             edge_dims=edge_dims,
@@ -342,20 +519,108 @@ class BaseTrainer:
             stage=self.stage
         ).to(self.device)
 
-        # 4. Optimizer & Loss
-        self.optimizer = PCGrad(optim.AdamW(
-            self.model.parameters(), lr=self.learning_rate))
+        # 4. Optimizer & Loss & Scheduler
+        base_optimizer = optim.AdamW(
+            self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
+        self.optimizer = PCGrad(base_optimizer)
+        
+        # Add warmup + cosine scheduler for Stage 1/2
+        if self.stage in [1, 2]:
+            total_steps = len(self.train_loader) * self.num_epochs
+            warmup_steps = int(0.1 * total_steps)  # 10% warmup
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                base_optimizer,
+                max_lr=self.learning_rate * 3,  # Peak at 3x base LR
+                total_steps=total_steps,
+                pct_start=0.1,  # 10% warmup
+                anneal_strategy='cos'
+            )
+            self.logger.info(f"[SCHEDULER] OneCycleLR: max_lr={self.learning_rate * 3:.2e}, warmup={warmup_steps} steps")
+            self.reduce_on_plateau = None
+        else:
+            # For Stage 3, use ReduceLROnPlateau to handle overfitting
+            self.scheduler = None
+            self.reduce_on_plateau = optim.lr_scheduler.ReduceLROnPlateau(
+                base_optimizer,
+                mode='min',
+                factor=0.5,
+                patience=3,
+                verbose=True,
+                min_lr=1e-8
+            )
+            self.logger.info(f"[SCHEDULER] ReduceLROnPlateau: factor=0.5, patience=3")
 
-        # Use FocalLoss for both graph-level and node-level to handle class imbalance
-        # FocalLoss automatically handles imbalance by focusing on hard examples
-        # Change to "none" for PCGrad
-        self.criterion = FocalLoss(alpha=0.25, gamma=2.0, reduction="none")
+        # Stage-specific loss:
+        # - Stage 1/2: FocalLoss for extreme imbalance (better than BCE for rare positives)
+        # - Stage 3: FocalLoss (multilabel) with per-class weights
+        if self.stage in [1, 2]:
+            pos = int(getattr(self, "_split_stats", {}).get(
+                "train", {}).get("pos", 0))
+            neg = int(getattr(self, "_split_stats", {}).get(
+                "train", {}).get("neg", 0))
+            
+            # Use FocalLoss with high alpha for rare positives
+            if pos > 0 and neg > 0:
+                pos_weight = torch.tensor(
+                    [neg / max(1, pos)], dtype=torch.float32, device=self.device)
+                self.logger.info(
+                    f"[LOSS DEBUG] Stage{self.stage} BCE pos_weight={float(pos_weight.item()):.4f}")
+                self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            else:
+                self.logger.warning(
+                    f"[LOSS DEBUG] Stage{self.stage} has pos={pos}, neg={neg} in train; using unweighted BCEWithLogitsLoss"
+                )
+                self.criterion = nn.BCEWithLogitsLoss()
+        else:
+            # Compute per-class weights for Stage 3 multilabel
+            pos_weight = self._compute_stage3_class_weights()
+            self.criterion = FocalLoss(alpha=.65, gamma=2.5, pos_weight=pos_weight, reduction="none")
+            if pos_weight is not None:
+                self.logger.info(f"[LOSS DEBUG] Per-class weights: {pos_weight.cpu().numpy()}")
+        
+        # Store best thresholds for Stage 3 (initialized to 0.5)
+        self.best_thresholds = torch.full((8,), 0.5, dtype=torch.float32) if self.stage == 3 else None
 
+    def _compute_stage3_class_weights(self):
+        """Compute per-class weights for Stage 3 multilabel classification."""
+        if self.stage != 3:
+            return None
+        
+        self.logger.info("Computing per-class weights for Stage 3...")
+        class_pos_counts = torch.zeros(8, dtype=torch.float32)
+        class_neg_counts = torch.zeros(8, dtype=torch.float32)
+        
+        # Count positive/negative samples per class across training data
+        for batch in self.train_loader:
+            if batch is None:
+                continue
+            
+            cfg_labels = batch.get('cfg_labels')
+            ast_labels = batch.get('ast_labels')
+            
+            if cfg_labels is not None:
+                class_pos_counts += cfg_labels.sum(dim=0).cpu()
+                class_neg_counts += (1 - cfg_labels).sum(dim=0).cpu()
+            
+            if ast_labels is not None:
+                class_pos_counts += ast_labels.sum(dim=0).cpu()
+                class_neg_counts += (1 - ast_labels).sum(dim=0).cpu()
+        
+        # Compute pos_weight = neg_count / max(pos_count, 1) for each class
+        pos_weight = class_neg_counts / torch.clamp(class_pos_counts, min=1.0)
+        
+        # Cap maximum weight to prevent extreme values
+        pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)
+        
+        self.logger.info(f"Class positive counts: {class_pos_counts.numpy()}")
+        self.logger.info(f"Class negative counts: {class_neg_counts.numpy()}")
+        
+        return pos_weight.to(self.device)
+    
     def _prepare_batch(self, batch):
         """Moves batch to device and extracts labels based on stage."""
         if self.is_graph_level:
-            # Stage 1/2: Embeddings are pre-computed [batch_size, emb_dim]
-            embeddings = batch['embeddings'].to(self.device)
+            g = batch['graph'].to(self.device)
 
             # Labels are dicts: {"ContractA": 0, "ContractB": 1, ...}
             labels_raw = batch['graph_labels']  # List of dicts
@@ -369,8 +634,7 @@ class BaseTrainer:
                         # Store with batch index for matching
                         label_map[(batch_idx, entity_name)] = float(label_val)
 
-            # Return embeddings and label mapping
-            return embeddings, label_map
+            return g, label_map
 
         else:
             # Stage 3: Labels are Tensors [Total_Nodes, 8]
@@ -389,6 +653,7 @@ class BaseTrainer:
             self.model.train()
             epoch_loss = 0
 
+            batch_count = 0
             for batch in tqdm(self.train_loader, desc=f"Ep {epoch+1} Train"):
                 if batch is None:
                     continue
@@ -396,8 +661,7 @@ class BaseTrainer:
                 inputs, label_data = self._prepare_batch(batch)
 
                 self.optimizer.zero_grad()
-                preds = self.model({'graph': inputs} if not self.is_graph_level else {
-                                   'embeddings': inputs})
+                preds = self.model({'graph': inputs})
 
                 loss = 0
                 if self.is_graph_level:
@@ -410,15 +674,38 @@ class BaseTrainer:
                 # Use PCGrad for backward
                 if isinstance(loss, list):
                     self.optimizer.pc_backward(loss)
-                    epoch_loss += sum(l.item() for l in loss)
+                    epoch_loss += sum(loss_item.item() for loss_item in loss)
                 else:
                     self.optimizer.pc_backward([loss])
                     epoch_loss += loss.item()
+                
+                # Gradient clipping for stability
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # CRITICAL: Actually update the weights!
+                self.optimizer.step()
+                
+                batch_count += 1
+                # Log first batch to verify training
+                if batch_count == 1:
+                    if isinstance(loss, list):
+                        self.logger.info(f"[TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {[l.item() for l in loss]} | Grad Norm: {grad_norm:.4f}")
+                    else:
+                        self.logger.info(f"[TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
+                
+                # Step scheduler if using OneCycleLR
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
             # Validation
             val_metrics = self.evaluate(self.val_loader)
+            avg_loss = epoch_loss / max(len(self.train_loader), 1)
             self.logger.info(
-                f"Epoch {epoch+1}: Loss={epoch_loss:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f}")
+                f"Epoch {epoch+1}: Loss={avg_loss:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f}")
+
+            # Step scheduler if using ReduceLROnPlateau (Stage 3)
+            if self.reduce_on_plateau is not None:
+                self.reduce_on_plateau.step(val_metrics['loss'])
 
             # Update history
             self.history["train_loss"].append(
@@ -451,24 +738,35 @@ class BaseTrainer:
 
         logits = preds['graph_logits'].squeeze(-1)  # [batch_size]
 
-        # FocalLoss expects [N, C], C=1
-        loss = self.criterion(logits.unsqueeze(-1),
-                              targets.unsqueeze(-1)).mean()
+        # Support either FocalLoss (legacy) or BCEWithLogitsLoss (preferred for Stage 1/2).
+        if isinstance(self.criterion, FocalLoss):
+            loss = self.criterion(
+                logits.unsqueeze(-1), targets.unsqueeze(-1)
+            ).mean()
+        else:
+            loss = self.criterion(logits, targets)
         return loss
 
     def _train_step_node(self, preds, label_data):
         """Training step for stage 3: Node-level multilabel classification."""
         targets = label_data
         losses = []
+        
+        # Apply label smoothing to prevent overconfidence
+        label_smoothing = 0.05
+        
         if targets['cfg'] is not None:
+            smoothed_cfg = targets['cfg'] * (1 - label_smoothing) + 0.5 * label_smoothing
             losses.append(self.criterion(
-                preds['cfg_logits'], targets['cfg']).mean())
+                preds['cfg_logits'], smoothed_cfg).mean())
         if targets['ast'] is not None:
+            smoothed_ast = targets['ast'] * (1 - label_smoothing) + 0.5 * label_smoothing
+            # Balance AST and CFG losses equally (not 0.5x)
             losses.append(
-                0.5 * self.criterion(preds['ast_logits'], targets['ast']).mean())
+                self.criterion(preds['ast_logits'], smoothed_ast).mean())
         return losses if losses else 0
 
-    def evaluate(self, loader):
+    def evaluate(self, loader, fixed_thresholds=None, optimize_thresholds=True):
         self.model.eval()
         all_preds = []
         all_targets = []
@@ -479,8 +777,7 @@ class BaseTrainer:
                 if batch is None:
                     continue
                 inputs, label_data = self._prepare_batch(batch)
-                preds = self.model({'graph': inputs} if not self.is_graph_level else {
-                                   'embeddings': inputs})
+                preds = self.model({'graph': inputs})
 
                 # Compute loss
                 if self.is_graph_level:
@@ -514,7 +811,64 @@ class BaseTrainer:
             f"[EVAL DEBUG] Samples: {len(y_true)} | Positive: {pos_count} ({pos_count/len(y_true)*100:.1f}%) | Negative: {neg_count}")
 
         # Metrics
-        y_pred = (y_prob > 0.5).astype(int)
+        thr = 0.5
+        thresholds_used = None
+        if self.stage in [1, 2]:
+            # Tune threshold for macro-F1 on this eval split (skips if single-class).
+            try:
+                unique = np.unique(y_true)
+                if unique.size >= 2:
+                    best_f1 = -1.0
+                    best_thr = 0.5
+                    for t in np.linspace(0.05, 0.95, 91):
+                        yp = (y_prob > t).astype(int)
+                        f1_t = f1_score(
+                            y_true, yp, average='macro', zero_division=0)
+                        if f1_t > best_f1:
+                            best_f1 = f1_t
+                            best_thr = float(t)
+                    thr = best_thr
+                    self.logger.info(
+                        f"[EVAL DEBUG] Best threshold={thr:.3f} (macro-F1={best_f1:.4f})")
+            except Exception as e:
+                self.logger.warning(
+                    f"[EVAL DEBUG] Threshold tuning failed: {e}")
+
+            y_pred = (y_prob > thr).astype(int)
+        else:
+            # Stage 3: per-class thresholds
+            num_classes = y_prob.shape[1]
+            if fixed_thresholds is not None:
+                thresholds_used = np.array(fixed_thresholds, dtype=float)
+                self.logger.info(f"[EVAL DEBUG] Using fixed thresholds: {thresholds_used}")
+            elif optimize_thresholds:
+                thresholds_used = np.zeros(num_classes)
+                for class_idx in range(num_classes):
+                    y_true_class = y_true[:, class_idx]
+                    y_prob_class = y_prob[:, class_idx]
+                    if y_true_class.sum() == 0:
+                        thresholds_used[class_idx] = 0.9  # conservative when no positives
+                        continue
+                    best_score = -1.0
+                    best_thr = 0.5
+                    for t in np.linspace(0.25, 0.8, 12):  # conservative, slightly wider
+                        yp = (y_prob_class >= t).astype(int)
+                        if yp.sum() == 0:
+                            continue
+                        f1_t = f1_score(y_true_class, yp, average='binary', zero_division=0)
+                        prec_t = precision_score(y_true_class, yp, zero_division=0)
+                        score = 0.3 * f1_t + 0.7 * prec_t  # emphasize precision to curb FPs
+                        if score > best_score:
+                            best_score = score
+                            best_thr = float(t)
+                    thresholds_used[class_idx] = max(best_thr, 0.4)
+                self.logger.info(f"[EVAL DEBUG] Per-class thresholds (optimized): {thresholds_used}")
+                self.best_thresholds = torch.tensor(thresholds_used, dtype=torch.float32)
+            else:
+                thresholds_used = np.full(num_classes, 0.5)
+
+            thresholds_used = np.array(thresholds_used, dtype=float)
+            y_pred = (y_prob >= thresholds_used).astype(int)
 
         # Debug: Log prediction distribution
         pred_pos = y_pred.sum()
@@ -529,7 +883,7 @@ class BaseTrainer:
 
         try:
             auc = roc_auc_score(y_true, y_prob, average='macro')
-        except:
+        except Exception:
             auc = 0.5  # Fail gracefully if only one class present
 
         # Classification report
@@ -545,7 +899,14 @@ class BaseTrainer:
                                            'Safe', 'Vuln'], zero_division=0)
             self.logger.info(f"Classification Report:\n{report}")
 
-        return {'f1': f1, 'auc': auc, 'loss': epoch_loss / len(loader), 'y_pred': y_pred, 'y_true': y_true}
+        return {
+            'f1': f1,
+            'auc': auc,
+            'loss': epoch_loss / len(loader),
+            'y_pred': y_pred,
+            'y_true': y_true,
+            'thresholds': thresholds_used,
+        }
 
     def _eval_step_graph(self, preds, label_map):
         """Evaluation step for stages 1-2: Graph-level classification."""

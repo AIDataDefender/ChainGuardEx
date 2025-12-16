@@ -42,31 +42,37 @@ class TrainerWithAnalysis(BaseTrainer):
         try:
             pos_samples = 0
             total_samples = 0
+
+            def _label_to_int(v):
+                """Coerce various label representations to {0,1}."""
+                try:
+                    if isinstance(v, torch.Tensor):
+                        if v.numel() != 1:
+                            return 0
+                        v = v.item()
+                    if isinstance(v, bool):
+                        v = int(v)
+                    if isinstance(v, (int, float)):
+                        return 1 if float(v) > 0.5 else 0
+                except Exception:
+                    return 0
+                return 0
             
             # Check first batch only for brevity
             for batch_idx, batch in enumerate(loader):
-                if batch is None: continue
+                if batch is None: 
+                    continue
                 
-                # 1. Graph Stats
-                if self.stage in [1, 2]:
-                    # No graph, use embeddings
-                    batch_size = batch['embeddings'].shape[0]
-                    
-                    if batch_idx == 0:
-                        self.logger.info(f"  Batch 0 Stats:")
-                        self.logger.info(f"    Embeddings: {batch_size}")
-                        self.logger.info(f"    Embedding Dim: {batch['embeddings'].shape[1]}")
-                        self.logger.info(f"    Device: {batch['embeddings'].device}")
-                else:
-                    g = batch['graph']
-                    batch_size = g.batch_size
-                    
-                    if batch_idx == 0:
-                        self.logger.info(f"  Batch 0 Stats:")
-                        self.logger.info(f"    Graphs: {batch_size}")
-                        self.logger.info(f"    Nodes: {g.num_nodes()} (Avg {g.num_nodes()/batch_size:.1f})")
-                        self.logger.info(f"    Edges: {g.num_edges()}")
-                        self.logger.info(f"    Device: {g.device}")
+                
+                g = batch['graph']
+                batch_size = g.batch_size
+                
+                if batch_idx == 0:
+                    self.logger.info(f"  Batch 0 Stats:")  # noqa: F541
+                    self.logger.info(f"    Graphs: {batch_size}")
+                    self.logger.info(f"    Nodes: {g.num_nodes()} (Avg {g.num_nodes()/batch_size:.1f})")
+                    self.logger.info(f"    Edges: {g.num_edges()}")
+                    self.logger.info(f"    Device: {g.device}")
 
                 # 2. Label Stats
                 # Extract logic similar to BaseTrainer._prepare_batch
@@ -76,21 +82,29 @@ class TrainerWithAnalysis(BaseTrainer):
                     
                     # DEBUG: Log first batch labels to understand structure
                     if batch_idx == 0:
-                        self.logger.info(f"  DEBUG - Label dicts for first 3 GRAPHS (each graph has multiple contracts):")
+                        self.logger.info(f"  DEBUG - Label dicts for first 3 GRAPHS (each graph is one contracts):")
                         for i, graph_labels in enumerate(raw[:3] if len(raw) >= 3 else raw):
                             num_contracts = len(graph_labels) if isinstance(graph_labels, dict) else 1
-                            num_vuln = sum(1 for v in graph_labels.values() if v == 1) if isinstance(graph_labels, dict) else (1 if graph_labels == 1 else 0)
+                            num_vuln = (
+                                sum(_label_to_int(v) for v in graph_labels.values())
+                                if isinstance(graph_labels, dict)
+                                else _label_to_int(graph_labels)
+                            )
                             self.logger.info(f"    Graph {i+1}: {num_contracts} contracts, {num_vuln} vulnerable")
                             if isinstance(graph_labels, dict):
-                                vuln_contracts = [k for k, v in graph_labels.items() if v == 1]
+                                vuln_contracts = [k for k, v in graph_labels.items() if _label_to_int(v) == 1]
                                 if vuln_contracts:
                                     self.logger.info(f"      Vulnerable: {vuln_contracts}")
                     
                     # Convert to binary list
                     curr_pos = 0
                     for item in raw:
-                        if int(item) == 1:
-                            curr_pos += 1
+                        if isinstance(item, dict):
+                            # Count a graph as positive if any entity within it is vulnerable.
+                            if any(_label_to_int(v) == 1 for v in item.values()):
+                                curr_pos += 1
+                        else:
+                            curr_pos += _label_to_int(item)
                     
                     pos_samples += curr_pos
                     total_samples += len(raw)
@@ -194,7 +208,7 @@ class CascadeOrchestrator:
     
     def __init__(self):
         self.results = {}
-        self.stages = [1, 2, 3] # Gatekeeper -> Locator -> Specialist
+        self.stages = [1] # Gatekeeper -> Locator -> Specialist
         
     def run(self):
         print("\n" + "#"*60)
@@ -208,13 +222,12 @@ class CascadeOrchestrator:
             
             try:
                 # 1. Initialize Trainer for this stage
-                # Note: Adjust batch_size or params per stage if needed
-                bs = 16 if stage < 3 else 8 # Stage 3 graphs are smaller but more nodes? Adjust as needed.
+                bs = 32 if stage < 3 else 16 # Stage 3 graphs are smaller but more nodes? Adjust as needed.
                 trainer = TrainerWithAnalysis(
                     stage=stage,
                     batch_size=bs,
-                    num_epochs=20, # Adjust epochs
-                    do_test_data=True
+                    num_epochs=80, # Adjust epochs
+                    do_test_data=False
                 )
                 
                 # 2. Train

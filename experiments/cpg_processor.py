@@ -6,7 +6,7 @@ import networkx as nx
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
-from the_utils.c_2constants import GraphAttributes, EdgeTypes, NodeTypes, SEPARATOR
+from the_utils.c_2constants import GraphAttributes, EdgeTypes, NodeTypes
 import json
 import sys
 import os
@@ -103,14 +103,10 @@ class CPG_Processor:
         self.ast_node_label = NodeTypes.AST_NODE.value.lower()
 
         self.embedding_dims = {
-            "node_cfg": 768 + self._compute_struct_feature_size("cfg"),
-            "node_ast": 768 + self._compute_struct_feature_size("ast"),
+            "cfg_node": 768 + self._compute_struct_feature_size("cfg"),
+            "ast_node": 768 + self._compute_struct_feature_size("ast"),
             "edge": 768,
         }
-        # Aliases: many parts of the codebase refer to node types as cfg_node/ast_node
-        # while some configs use node_cfg/node_ast for dimension keys.
-        self.embedding_dims["cfg_node"] = self.embedding_dims["node_cfg"]
-        self.embedding_dims["ast_node"] = self.embedding_dims["node_ast"]
         self.rel_names = None
 
     def _normalize_node_type(self, raw: Any) -> str:
@@ -129,11 +125,10 @@ class CPG_Processor:
         # Common variants
         mapping = {
             "cfg_node": self.cfg_node_label,
-            "node_cfg": self.cfg_node_label,
             "cfg": self.cfg_node_label,
             "ast_node": self.ast_node_label,
-            "node_ast": self.ast_node_label,
             "ast": self.ast_node_label,
+            # Legacy variants are no longer supported; prefer canonical names only.
         }
         if s in mapping:
             return mapping[s]
@@ -179,8 +174,10 @@ class CPG_Processor:
                         f"{project_name} stage3 {subkey}: label must contain cfg_node/ast_node"
                     )
 
-                cfg_nodes = g.num_nodes(self.cfg_node_label) if self.cfg_node_label in g.ntypes else 0
-                ast_nodes = g.num_nodes(self.ast_node_label) if self.ast_node_label in g.ntypes else 0
+                cfg_nodes = g.num_nodes(
+                    self.cfg_node_label) if self.cfg_node_label in g.ntypes else 0
+                ast_nodes = g.num_nodes(
+                    self.ast_node_label) if self.ast_node_label in g.ntypes else 0
                 cfg_labels = lbl.get("cfg_node") or []
                 ast_labels = lbl.get("ast_node") or []
                 if len(cfg_labels) != cfg_nodes:
@@ -510,7 +507,8 @@ class CPG_Processor:
             alert_dict[n_type][nid] = label
             stage3_labels[n_type].append(label)
 
-            node_is_vuln[nid] = any(label_value > 0 for label_value in label)  # max-pooling
+            node_is_vuln[nid] = any(
+                label_value > 0 for label_value in label)  # max-pooling
             if node_is_vuln[nid]:
                 print(
                     f"Node {nid} {n_type} marked as vulnerable with labels: {owasp_list}"
@@ -551,7 +549,8 @@ class CPG_Processor:
                     + list(c_data.get("ast_nodes", set()))
                 )
                 contract_key = f"{file_name}_{contract}"
-                stage1_labels[contract_key] = 1 if (func_vuln or node_vuln) else 0
+                stage1_labels[contract_key] = 1 if (
+                    func_vuln or node_vuln) else 0
                 if func_vuln or node_vuln:
                     print(
                         f"Contract {contract_key} marked vulnerable (func_vuln={func_vuln}, node_vuln={node_vuln})"
@@ -742,7 +741,8 @@ class CPG_Processor:
                 indexed_labels = {"cfg_node": [], "ast_node": []}
                 for nid, node_data in func_graph.nodes(data=True):
                     n_type = self._normalize_node_type(
-                        node_data.get(GraphAttributes.NODE_TYPE, NodeTypes.CFG_NODE)
+                        node_data.get(GraphAttributes.NODE_TYPE,
+                                      NodeTypes.CFG_NODE)
                     )
 
                     # Get OWASP list for this node
@@ -805,7 +805,7 @@ class CPG_Processor:
                 node_storage[n_type].setdefault(
                     "contracts", []).append(contract)
                 node_storage[n_type].setdefault("functions", []).append(
-                    f"{contract}{SEPARATOR}{function}"
+                    f"{contract}_{function}"
                 )
 
             # 2. Build Edge Lists
@@ -849,7 +849,8 @@ class CPG_Processor:
                     print(f"Saved debug graph to {debug_dot_path}")
                 except Exception as e:
                     print(f"Failed to save debug .dot: {e}")
-                fallback_ntype = next(iter(node_storage.keys()), self.cfg_node_label)
+                fallback_ntype = next(
+                    iter(node_storage.keys()), self.cfg_node_label)
                 graph_data = {
                     (fallback_ntype, "dummy", fallback_ntype): (
                         torch.tensor([], dtype=torch.long),
@@ -903,7 +904,7 @@ class CPG_Processor:
                 # Store original node IDs for Stage 3 label mapping
                 g.nodes[n_type].data["node_ids"] = torch.tensor(
                     [int(nid) if str(nid).isdigit() else hash(str(nid)) %
-                     (2**31) for nid in store["ids"]],
+                        (2**31) for nid in store["ids"]],
                     dtype=torch.long
                 )
 
@@ -1068,7 +1069,8 @@ class CPG_Processor:
                         break
 
         print(f"Verified {len(verified_checkpoints)} valid checkpoints.")
-
+        # temp skip processing
+        projects_to_process = []
         # Process remaining projects first (to avoid OOM)
         for item in tqdm(projects_to_process, desc="Processing graphs"):
             p_name, nx_g = item
@@ -1097,43 +1099,43 @@ class CPG_Processor:
                 s2_g = self._prune_stage2(s1_g, s2_lbl, hierarchy, vuln_map)
                 s3_g = self._prune_stage3(s2_g, vuln_data)
 
-                # Compute totals and max for stages (since they are dicts of graphs)
-                s1_total_nodes = sum(
-                    g["graph"].number_of_nodes() for g in s1_g.values()
-                )
-                s1_total_edges = sum(
-                    g["graph"].number_of_edges() for g in s1_g.values()
-                )
-                s1_max_nodes = max(
-                    (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
-                )
-                s1_max_edges = max(
-                    (g["graph"].number_of_edges() for g in s1_g.values()), default=0
-                )
-                s1_min_nodes = min(
-                    (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
-                )
-                s1_min_edges = min(
-                    (g["graph"].number_of_edges() for g in s1_g.values()), default=0
-                )
-                s2_total_nodes = sum(
-                    g["graph"].number_of_nodes() for g in s2_g.values()
-                )
-                s2_total_edges = sum(
-                    g["graph"].number_of_edges() for g in s2_g.values()
-                )
-                s2_max_nodes = max(
-                    (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
-                )
-                s2_max_edges = max(
-                    (g["graph"].number_of_edges() for g in s2_g.values()), default=0
-                )
-                s2_min_nodes = min(
-                    (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
-                )
-                s2_min_edges = min(
-                    (g["graph"].number_of_edges() for g in s2_g.values()), default=0
-                )
+                # # Compute totals and max for stages (since they are dicts of graphs)
+                # s1_total_nodes = sum(
+                #     g["graph"].number_of_nodes() for g in s1_g.values()
+                # )
+                # s1_total_edges = sum(
+                #     g["graph"].number_of_edges() for g in s1_g.values()
+                # )
+                # s1_max_nodes = max(
+                #     (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
+                # )
+                # s1_max_edges = max(
+                #     (g["graph"].number_of_edges() for g in s1_g.values()), default=0
+                # )
+                # s1_min_nodes = min(
+                #     (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
+                # )
+                # s1_min_edges = min(
+                #     (g["graph"].number_of_edges() for g in s1_g.values()), default=0
+                # )
+                # s2_total_nodes = sum(
+                #     g["graph"].number_of_nodes() for g in s2_g.values()
+                # )
+                # s2_total_edges = sum(
+                #     g["graph"].number_of_edges() for g in s2_g.values()
+                # )
+                # s2_max_nodes = max(
+                #     (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
+                # )
+                # s2_max_edges = max(
+                #     (g["graph"].number_of_edges() for g in s2_g.values()), default=0
+                # )
+                # s2_min_nodes = min(
+                #     (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
+                # )
+                # s2_min_edges = min(
+                #     (g["graph"].number_of_edges() for g in s2_g.values()), default=0
+                # )
                 s3_total_nodes = sum(
                     g["graph"].number_of_nodes() for g in s3_g.values()
                 )
@@ -1141,13 +1143,13 @@ class CPG_Processor:
                     g["graph"].number_of_edges() for g in s3_g.values()
                 )
 
-                print("=" * 40)
-                print(
-                    f"    Stage1 Total Nodes={s1_total_nodes} (Max={s1_max_nodes}) (Min={s1_min_nodes}) Edges={s1_total_edges} (Max={s1_max_edges}) (Min={s1_min_edges})"
-                )
-                print(
-                    f"    Stage2 Total Nodes={s2_total_nodes} (Max={s2_max_nodes}) (Min={s2_min_nodes}) Edges={s2_total_edges} (Max={s2_max_edges}) (Min={s2_min_edges})"
-                )
+                # print("=" * 40)
+                # print(
+                #     f"    Stage1 Total Nodes={s1_total_nodes} (Max={s1_max_nodes}) (Min={s1_min_nodes}) Edges={s1_total_edges} (Max={s1_max_edges}) (Min={s1_min_edges})"
+                # )
+                # print(
+                #     f"    Stage2 Total Nodes={s2_total_nodes} (Max={s2_max_nodes}) (Min={s2_min_nodes}) Edges={s2_total_edges} (Max={s2_max_edges}) (Min={s2_min_edges})"
+                # )
                 print(
                     f"    Stage3 Nodes={s3_total_nodes} Edges={s3_total_edges}")
                 print("=" * 40)
@@ -1173,26 +1175,36 @@ class CPG_Processor:
                           for k, v in tqdm(s3_g.items(), desc="Conv Stage3")}
 
                 # Count vuln labels in stage3
-                stage3_vuln_labels = sum(
-                    len(data["label"]["ast_node"]) +
-                    len(data["label"]["cfg_node"])
-                    for data in s3_g.values()
-                )
+                stage3_vuln_labels = 0
+                for key, data in s3_g.items():
+                    for y in data["label"]["ast_node"]:
+                        if sum(y) > 0:
+                            stage3_vuln_labels += 1
+                            break
+                    for x in data["label"]["cfg_node"]:
+                        if sum(x) > 0:
+                            stage3_vuln_labels += 1
+                            break
                 print(
                     f"Vuln labels {stage3_vuln_labels}/{original_vuln_count} intact")
-
                 # Build stage-keyed labels aligned with the pruned graph keys
                 # - Stage 1: key is "{file}_{contract}"
                 # - Stage 2: key is "{file}_{contract}_{function}"
                 # - Stage 3: key is Stage 2 key (vulnerable functions only)
-                s1_labels_by_key = {k: v.get("label", 0) for k, v in s1_g.items()}
-                s2_labels_by_key = {k: v.get("label", 0) for k, v in s2_g.items()}
-                s3_labels_by_key = {k: v.get("label", {}) for k, v in s3_g.items()}
+                s1_labels_by_key = {k: v.get("label", 0)
+                                    for k, v in s1_g.items()}
+                s2_labels_by_key = {k: v.get("label", 0)
+                                    for k, v in s2_g.items()}
+                s3_labels_by_key = {k: v.get("label", {})
+                                    for k, v in s3_g.items()}
 
                 # Fail-fast contract validation (prevents silent schema drift)
-                self._validate_project_stage_outputs(p_name, 1, dgl_s1, s1_labels_by_key)
-                self._validate_project_stage_outputs(p_name, 2, dgl_s2, s2_labels_by_key)
-                self._validate_project_stage_outputs(p_name, 3, dgl_s3, s3_labels_by_key)
+                self._validate_project_stage_outputs(
+                    p_name, 1, dgl_s1, s1_labels_by_key)
+                self._validate_project_stage_outputs(
+                    p_name, 2, dgl_s2, s2_labels_by_key)
+                self._validate_project_stage_outputs(
+                    p_name, 3, dgl_s3, s3_labels_by_key)
 
                 # 6. Save checkpoint (MUST match current schema)
                 self._save_checkpoint(
@@ -1252,14 +1264,20 @@ class CPG_Processor:
                     p_name, 3, checkpoint["stage3_graph"], checkpoint["stage3_labels"]
                 )
 
-                results["stage1"]["graphs"].append((p_name, checkpoint["stage1_graph"]))
-                results["stage1"]["labels"].append((p_name, checkpoint["stage1_labels"]))
+                results["stage1"]["graphs"].append(
+                    (p_name, checkpoint["stage1_graph"]))
+                results["stage1"]["labels"].append(
+                    (p_name, checkpoint["stage1_labels"]))
 
-                results["stage2"]["graphs"].append((p_name, checkpoint["stage2_graph"]))
-                results["stage2"]["labels"].append((p_name, checkpoint["stage2_labels"]))
+                results["stage2"]["graphs"].append(
+                    (p_name, checkpoint["stage2_graph"]))
+                results["stage2"]["labels"].append(
+                    (p_name, checkpoint["stage2_labels"]))
 
-                results["stage3"]["graphs"].append((p_name, checkpoint["stage3_graph"]))
-                results["stage3"]["labels"].append((p_name, checkpoint["stage3_labels"]))
+                results["stage3"]["graphs"].append(
+                    (p_name, checkpoint["stage3_graph"]))
+                results["stage3"]["labels"].append(
+                    (p_name, checkpoint["stage3_labels"]))
             else:
                 print(
                     f"  Warning: Checkpoint for {p_name} is missing/incompatible; will reprocess."
@@ -1267,7 +1285,8 @@ class CPG_Processor:
                 nx_g = nx_lookup.get(p_name)
                 vuln_data = vuln_lookup.get(p_name)
                 if nx_g is None or vuln_data is None:
-                    print(f"  Warning: Cannot reprocess {p_name} (missing nx graph or vuln data)")
+                    print(
+                        f"  Warning: Cannot reprocess {p_name} (missing nx graph or vuln data)")
                     continue
 
                 try:
@@ -1275,32 +1294,46 @@ class CPG_Processor:
                     s3_lbl, s2_lbl, s1_lbl, original_vuln_count, vuln_map = (
                         self._create_stage_labels(nx_g, hierarchy, vuln_data)
                     )
-                    s1_g = self._prune_stage1(nx_g, s1_lbl, hierarchy, vuln_map)
-                    s2_g = self._prune_stage2(s1_g, s2_lbl, hierarchy, vuln_map)
+                    s1_g = self._prune_stage1(
+                        nx_g, s1_lbl, hierarchy, vuln_map)
+                    s2_g = self._prune_stage2(
+                        s1_g, s2_lbl, hierarchy, vuln_map)
                     s3_g = self._prune_stage3(s2_g, vuln_data)
 
-                    dgl_s1 = {k: self.nx_to_dgl(v["graph"]) for k, v in s1_g.items()}
-                    dgl_s2 = {k: self.nx_to_dgl(v["graph"]) for k, v in s2_g.items()}
-                    dgl_s3 = {k: self.nx_to_dgl(v["graph"]) for k, v in s3_g.items()}
+                    dgl_s1 = {k: self.nx_to_dgl(v["graph"])
+                              for k, v in s1_g.items()}
+                    dgl_s2 = {k: self.nx_to_dgl(v["graph"])
+                              for k, v in s2_g.items()}
+                    dgl_s3 = {k: self.nx_to_dgl(v["graph"])
+                              for k, v in s3_g.items()}
 
-                    s1_labels_by_key = {k: v.get("label", 0) for k, v in s1_g.items()}
-                    s2_labels_by_key = {k: v.get("label", 0) for k, v in s2_g.items()}
-                    s3_labels_by_key = {k: v.get("label", {}) for k, v in s3_g.items()}
+                    s1_labels_by_key = {k: v.get("label", 0)
+                                        for k, v in s1_g.items()}
+                    s2_labels_by_key = {k: v.get("label", 0)
+                                        for k, v in s2_g.items()}
+                    s3_labels_by_key = {k: v.get("label", {})
+                                        for k, v in s3_g.items()}
 
-                    self._validate_project_stage_outputs(p_name, 1, dgl_s1, s1_labels_by_key)
-                    self._validate_project_stage_outputs(p_name, 2, dgl_s2, s2_labels_by_key)
-                    self._validate_project_stage_outputs(p_name, 3, dgl_s3, s3_labels_by_key)
+                    self._validate_project_stage_outputs(
+                        p_name, 1, dgl_s1, s1_labels_by_key)
+                    self._validate_project_stage_outputs(
+                        p_name, 2, dgl_s2, s2_labels_by_key)
+                    self._validate_project_stage_outputs(
+                        p_name, 3, dgl_s3, s3_labels_by_key)
 
                     self._save_checkpoint(
                         p_name, dgl_s1, dgl_s2, dgl_s3, s1_labels_by_key, s2_labels_by_key, s3_labels_by_key
                     )
 
                     results["stage1"]["graphs"].append((p_name, dgl_s1))
-                    results["stage1"]["labels"].append((p_name, s1_labels_by_key))
+                    results["stage1"]["labels"].append(
+                        (p_name, s1_labels_by_key))
                     results["stage2"]["graphs"].append((p_name, dgl_s2))
-                    results["stage2"]["labels"].append((p_name, s2_labels_by_key))
+                    results["stage2"]["labels"].append(
+                        (p_name, s2_labels_by_key))
                     results["stage3"]["graphs"].append((p_name, dgl_s3))
-                    results["stage3"]["labels"].append((p_name, s3_labels_by_key))
+                    results["stage3"]["labels"].append(
+                        (p_name, s3_labels_by_key))
                 except Exception as e:
                     print(f"  Warning: Failed to reprocess {p_name}: {e}")
                     traceback.print_exc()
@@ -1314,12 +1347,14 @@ class CPG_Processor:
             if graphs:
                 sample_project, sample_graphs = graphs[0]
                 print(f"    Sample project: {sample_project}")
-                print(f"    Sample graphs container type: {type(sample_graphs)}")
+                print(
+                    f"    Sample graphs container type: {type(sample_graphs)}")
 
                 if isinstance(sample_graphs, dict):
                     subkeys = list(sample_graphs.keys())
                     print(f"    Subgraphs: {len(subkeys)}")
-                    print(f"    First subkey: {subkeys[0] if subkeys else None}")
+                    print(
+                        f"    First subkey: {subkeys[0] if subkeys else None}")
                     if subkeys:
                         g0 = sample_graphs[subkeys[0]]
                         print(f"    First subgraph type: {type(g0)}")
@@ -1329,7 +1364,8 @@ class CPG_Processor:
             if labels:
                 sample_project, sample_labels = labels[0]
                 print(f"    Sample label project: {sample_project}")
-                print(f"    Sample labels container type: {type(sample_labels)}")
+                print(
+                    f"    Sample labels container type: {type(sample_labels)}")
                 if isinstance(sample_labels, dict):
                     label_keys = list(sample_labels.keys())
                     print(f"    Label keys: {len(label_keys)}")
@@ -1338,7 +1374,8 @@ class CPG_Processor:
                         v0 = sample_labels[k0]
                         print(f"    First label key: {k0}")
                         if isinstance(v0, dict):
-                            print(f"    First label dict keys: {list(v0.keys())}")
+                            print(
+                                f"    First label dict keys: {list(v0.keys())}")
                         else:
                             print(f"    First label type: {type(v0)}")
 

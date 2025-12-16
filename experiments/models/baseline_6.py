@@ -19,8 +19,8 @@ class EdgeGATLayer(nn.Module):
         in_edge_feats,
         out_feats,
         num_heads=2,
-        feat_drop=0.1,
-        attn_drop=0.1,
+        feat_drop=0.2,
+        attn_drop=0.2,
     ):
         super(EdgeGATLayer, self).__init__()
         self.num_heads = num_heads
@@ -134,8 +134,11 @@ class CascadedHeteroModel(nn.Module):
                 out_feats=hidden_dim // 4,  # 4 heads
                 num_heads=4,
             )
+        self.norm1 = nn.ModuleDict({
+            ntype: nn.LayerNorm(hidden_dim) for ntype in ['ast_node', 'cfg_node']
+        })
 
-        # Layer 2
+        # Layer 2: 8 heads with normalization
         self.layer2 = nn.ModuleDict()
         for rel in rel_names:
             rel_key = "_".join(rel)
@@ -146,40 +149,53 @@ class CascadedHeteroModel(nn.Module):
                 out_feats=hidden_dim // 4,
                 num_heads=4,
             )
+        self.norm2 = nn.ModuleDict({
+            ntype: nn.LayerNorm(hidden_dim) for ntype in ['ast_node', 'cfg_node']
+        })
+
+        # Layer 3: Deeper reasoning with 4 heads
+        self.layer3 = nn.ModuleDict()
+        for rel in rel_names:
+            rel_key = "_".join(rel)
+            self.layer3[rel_key] = EdgeGATLayer(
+                in_node_feats_src=hidden_dim,
+                in_node_feats_dst=hidden_dim,
+                in_edge_feats=edge_dims.get(rel, 64),
+                out_feats=hidden_dim // 4,
+                num_heads=4,
+            )
+        self.norm3 = nn.ModuleDict({
+            ntype: nn.LayerNorm(hidden_dim) for ntype in ['ast_node', 'cfg_node']
+        })
 
         # --- Stage-Specific Heads ---
 
         if self.stage == "3":
-            # Stage 3: Node Classification (Block Level)
-            # Output: 8 classes (Multi-label)
-            # Use deeper MLPs with dropout for better multilabel classification
-            self.classify_ast = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.LayerNorm(hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(hidden_dim // 2, hidden_dim // 4),
-                nn.LayerNorm(hidden_dim // 4),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(hidden_dim // 4, out_dim)
-            )
-            self.classify_cfg = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.LayerNorm(hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(hidden_dim // 2, hidden_dim // 4),
-                nn.LayerNorm(hidden_dim // 4),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(hidden_dim // 4, out_dim)
-            )
+            # Stage 3: Enhanced classifiers with class-specific attention
+            # AST classifier with skip connection and class attention
+            self.ast_fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+            self.ast_norm1 = nn.LayerNorm(hidden_dim // 2)
+            self.ast_fc2 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+            self.ast_fc3 = nn.Linear(hidden_dim // 4, out_dim)
+            self.ast_skip = nn.Linear(hidden_dim, out_dim)  # Skip connection
+            self.ast_class_attn = nn.Linear(
+                hidden_dim, out_dim)  # Class attention
+
+            # CFG classifier with skip connection and class attention
+            self.cfg_fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+            self.cfg_norm1 = nn.LayerNorm(hidden_dim // 2)
+            self.cfg_fc2 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+            self.cfg_fc3 = nn.Linear(hidden_dim // 4, out_dim)
+            self.cfg_skip = nn.Linear(hidden_dim, out_dim)  # Skip connection
+            self.cfg_class_attn = nn.Linear(
+                hidden_dim, out_dim)  # Class attention
+
+            self.dropout = nn.Dropout(0.3)
 
         else:
             # Stage 1 & 2: Graph/Subgraph Classification (Contract/Function Level)
             # Use attention-based pooling and deeper classifier for extreme imbalance
-            
+
             # Attention pooling gates for AST and CFG
             self.ast_pool_gate = nn.Sequential(
                 nn.Linear(hidden_dim, 1),
@@ -189,20 +205,18 @@ class CascadedHeteroModel(nn.Module):
                 nn.Linear(hidden_dim, 1),
                 nn.LeakyReLU()
             )
-            
+
             # Deeper classifier with residual connections and dropout
             self.classifier = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(0.3),
                 nn.Linear(hidden_dim, hidden_dim // 2),
                 nn.LayerNorm(hidden_dim // 2),
                 nn.ReLU(),
-                nn.Dropout(0.2),
                 nn.Linear(hidden_dim // 2, hidden_dim // 4),
                 nn.ReLU(),
-                nn.Dropout(0.1),
+                nn.Dropout(0.3),
                 nn.Linear(hidden_dim // 4, 1),  # Binary Logit
             )
 
@@ -218,7 +232,10 @@ class CascadedHeteroModel(nn.Module):
         # g.ndata["feat"] returns a dict: {node_type: tensor}
         # g.edata["feat"] returns a dict: {edge_type_tuple: tensor}
 
-        # --- 1. GNN Backbone (Message Passing) ---
+        # --- 1. Enhanced GNN Backbone with Residual Connections ---
+
+        # Store initial features for potential skip connections
+        h0 = {ntype: g.nodes[ntype].data["feat"] for ntype in g.ntypes}
 
         # Layer 1
         h1 = {
@@ -246,10 +263,12 @@ class CascadedHeteroModel(nn.Module):
 
             h1[dsttype] += res
 
-        h1 = {k: F.elu(v) for k, v in h1.items()}
+        # Apply normalization and activation
+        h1 = {k: F.elu(self.norm1[k](v)) if k in self.norm1 else F.elu(
+            v) for k, v in h1.items()}
 
-        # Layer 2
-        h2 = {ntype: torch.zeros_like(h1[ntype]) for ntype in g.ntypes}
+        # Layer 2 with residual connection
+        h2_raw = {ntype: torch.zeros_like(h1[ntype]) for ntype in g.ntypes}
 
         for rel in self.rel_names:
             srctype, etype, dsttype = rel
@@ -264,21 +283,59 @@ class CascadedHeteroModel(nn.Module):
 
             res = self.layer2[rel_key](
                 g[rel], h1[srctype], h1[dsttype], edge_feat)
-            h2[dsttype] += res
+            h2_raw[dsttype] += res
 
-        h2 = {k: F.elu(v) for k, v in h2.items()}
+        # Residual connection + normalization
+        h2 = {k: F.elu(self.norm2[k](
+            h2_raw[k] + h1[k])) if k in self.norm2 else F.elu(h2_raw[k] + h1[k]) for k in h2_raw}
 
-        # --- 2. Node Classification ---
-        # Return distinct logits for AST and CFG nodes
+        # Layer 3 with residual connection
+        h3_raw = {ntype: torch.zeros_like(h2[ntype]) for ntype in g.ntypes}
+
+        for rel in self.rel_names:
+            srctype, etype, dsttype = rel
+            rel_key = "_".join(rel)
+
+            if rel not in g.canonical_etypes or g.num_edges(rel) == 0:
+                continue
+
+            edge_feat = g.edges[rel].data["feat"]
+
+            res = self.layer3[rel_key](
+                g[rel], h2[srctype], h2[dsttype], edge_feat)
+            h3_raw[dsttype] += res
+
+        # Residual connection + normalization
+        h3 = {k: F.elu(self.norm3[k](
+            h3_raw[k] + h2[k])) if k in self.norm3 else F.elu(h3_raw[k] + h2[k]) for k in h3_raw}
+
+        # Use h3 as final layer for classification
+        h_final = h3
 
         # Safe retrieval for unmapped types
         def get_h(ntype):
-            return h2.get(ntype, torch.zeros(0, self.hidden_dim, device=g.device))
+            return h_final.get(ntype, torch.zeros(0, self.hidden_dim, device=g.device))
 
         if self.stage == "3":
+            # AST classifier with skip connection and class attention
+            ast_h = get_h("ast_node")
+            ast_h1 = F.relu(self.ast_norm1(self.ast_fc1(ast_h)))
+            ast_h1 = self.dropout(ast_h1)
+            ast_h2 = F.relu(self.ast_fc2(ast_h1))
+            ast_logits = self.ast_fc3(
+                ast_h2) + self.ast_skip(ast_h) + self.ast_class_attn(ast_h)
+
+            # CFG classifier with skip connection and class attention
+            cfg_h = get_h("cfg_node")
+            cfg_h1 = F.relu(self.cfg_norm1(self.cfg_fc1(cfg_h)))
+            cfg_h1 = self.dropout(cfg_h1)
+            cfg_h2 = F.relu(self.cfg_fc2(cfg_h1))
+            cfg_logits = self.cfg_fc3(
+                cfg_h2) + self.cfg_skip(cfg_h) + self.cfg_class_attn(cfg_h)
+
             return {
-                "ast_logits": self.classify_ast(get_h("ast_node")),
-                "cfg_logits": self.classify_cfg(get_h("cfg_node")),
+                "ast_logits": ast_logits,
+                "cfg_logits": cfg_logits,
             }
 
         else:
@@ -287,28 +344,34 @@ class CascadedHeteroModel(nn.Module):
                 """Apply attention-based pooling to node features."""
                 if g.num_nodes(ntype) == 0:
                     return torch.zeros(g.batch_size, self.hidden_dim, device=g.device)
-                
+
                 # Compute attention scores
                 attn_scores = gate_nn(node_feats)  # [N, 1]
-                
+
                 # Store in graph for batch-wise pooling
                 g.nodes[ntype].data['h'] = node_feats
                 g.nodes[ntype].data['a'] = attn_scores
-                
+
                 # Softmax attention per graph in batch
-                g.nodes[ntype].data['a'] = dgl.softmax_nodes(g, 'a', ntype=ntype)
-                
+                g.nodes[ntype].data['a'] = dgl.softmax_nodes(
+                    g, 'a', ntype=ntype)
+
                 # Weighted sum
-                g.nodes[ntype].data['h_weighted'] = node_feats * g.nodes[ntype].data['a']
-                pooled = dgl.readout_nodes(g, 'h_weighted', ntype=ntype, op='sum')
-                
+                g.nodes[ntype].data['h_weighted'] = node_feats * \
+                    g.nodes[ntype].data['a']
+                pooled = dgl.readout_nodes(
+                    g, 'h_weighted', ntype=ntype, op='sum')
+
                 return pooled
-            
+
+            # Use h3 (deepest layer) for richer representations
             ast_feats = get_h('ast_node')
             cfg_feats = get_h('cfg_node')
-            
-            ast_pooled = attention_pool(ast_feats, self.ast_pool_gate, g, 'ast_node')
-            cfg_pooled = attention_pool(cfg_feats, self.cfg_pool_gate, g, 'cfg_node')
+
+            ast_pooled = attention_pool(
+                ast_feats, self.ast_pool_gate, g, 'ast_node')
+            cfg_pooled = attention_pool(
+                cfg_feats, self.cfg_pool_gate, g, 'cfg_node')
 
             # Concatenate pooled features with max pooling for robustness
             # Shape: (batch_size, hidden_dim * 2)

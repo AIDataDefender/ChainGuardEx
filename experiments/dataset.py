@@ -1,5 +1,4 @@
 from torch.utils.data import Dataset
-from datetime import datetime
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -37,158 +36,141 @@ os.environ["DGLBACKEND"] = "pytorch"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def normalize_graph_keys(data):
-    """
-    Recursively converts dictionary keys to strings for DGL compatibility.
-    Handles Tuples (canonical edge types) and Enums.
-    """
-    if isinstance(data, dict):
-        new_data = {}
-        for k, v in data.items():
-            if isinstance(k, tuple):
-                k_str = tuple(
-                    elem.value if hasattr(elem, "value") else str(elem) for elem in k
-                )
-            elif hasattr(k, "value"):
-                k_str = str(k.value)
-            else:
-                k_str = str(k) if not isinstance(k, str) else k
-            new_data[k_str] = normalize_graph_keys(v)
-        return new_data
-    elif isinstance(data, list):
-        return [normalize_graph_keys(item) for item in data]
-    elif isinstance(data, tuple):
-        return tuple(normalize_graph_keys(item) for item in data)
-    else:
-        return data
-
-
-class GraphEmbedder(nn.Module):
-    def __init__(self, embedding_dim=768, num_heads=4, seed=42, node_in_dims=None):
-        super(GraphEmbedder, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.seed = seed
-        self._warned_unknown_dim = False
-
-        # Optional per-node-type projection so we can consume full node feature vectors
-        # (e.g., 806/834) while still outputting a stable embedding_dim (768).
-        self.node_proj = nn.ModuleDict()
-        if isinstance(node_in_dims, dict):
-            for ntype, in_dim in node_in_dims.items():
-                try:
-                    in_dim_int = int(in_dim)
-                except Exception:
-                    continue
-                if in_dim_int > 0 and in_dim_int != self.embedding_dim:
-                    self.node_proj[ntype] = nn.Linear(in_dim_int, self.embedding_dim)
-
-    def _to_embed_dim(self, feat: torch.Tensor, ntype: str) -> torch.Tensor:
-        """Project/pad/slice feat to [N, embedding_dim] without losing info when possible."""
-        if not isinstance(feat, torch.Tensor) or feat.dim() != 2:
-            raise TypeError(f"Expected 2D Tensor feat for {ntype}, got {type(feat)}")
-
-        # Preferred path: learned projection using full input width.
-        if ntype in self.node_proj:
-            return self.node_proj[ntype](feat)
-
-        # Fallback path (should be rare): pad/slice to match embedding_dim.
-        in_dim = feat.shape[1]
-        if in_dim == self.embedding_dim:
-            return feat
-
-        if not self._warned_unknown_dim:
-            logger.warning(
-                f"GraphEmbedder: missing projection for ntype={ntype} in_dim={in_dim}; falling back to pad/slice."
-            )
-            self._warned_unknown_dim = True
-
-        if in_dim > self.embedding_dim:
-            return feat[:, : self.embedding_dim]
-        pad = torch.zeros(
-            (feat.shape[0], self.embedding_dim - in_dim),
-            device=feat.device,
-            dtype=feat.dtype,
-        )
-        return torch.cat([feat, pad], dim=1)
-
-    def forward(self, g):
-        # Pre-compute graph embedding by multi-head attention pooling on all node features
-        all_node_feats = []
-        moved_to = None
-        if isinstance(g, dict):
-            # g is dict of {contract: dgl_graph}
-            for _, graph in g.items():
-                if hasattr(graph, "ntypes"):
-                    for ntype in graph.ntypes:
-                        feat = None
-                        try:
-                            feat = graph.nodes[ntype].data.get("feat")
-                        except Exception:
-                            feat = None
-                        if isinstance(feat, torch.Tensor) and feat.numel() > 0:
-                            # Ensure projection weights live on the same device as features.
-                            if moved_to is None and any(True for _ in self.parameters()):
-                                param_dev = next(self.parameters()).device
-                                if param_dev != feat.device:
-                                    self.to(feat.device)
-                            moved_to = feat.device
-                            all_node_feats.append(self._to_embed_dim(feat, str(ntype)))
-                else:
-                    # Homogeneous fallback
-                    feat = getattr(graph, "ndata", {}).get("feat") if hasattr(graph, "ndata") else None
-                    if isinstance(feat, torch.Tensor) and feat.numel() > 0:
-                        if moved_to is None and any(True for _ in self.parameters()):
-                            param_dev = next(self.parameters()).device
-                            if param_dev != feat.device:
-                                self.to(feat.device)
-                        moved_to = feat.device
-                        all_node_feats.append(self._to_embed_dim(feat, "_homogeneous"))
+def _rel_to_str_tuple(rel):
+    """Convert a canonical etype tuple elements to strings (handles Enums)."""
+    if not isinstance(rel, tuple) or len(rel) != 3:
+        return rel
+    out = []
+    for x in rel:
+        if hasattr(x, "value"):
+            out.append(str(x.value))
         else:
-            # g is single DGL graph
-            if hasattr(g, "ntypes"):
-                for ntype in g.ntypes:
-                    feat = None
-                    try:
-                        feat = g.nodes[ntype].data.get("feat")
-                    except Exception:
-                        feat = None
-                    if isinstance(feat, torch.Tensor) and feat.numel() > 0:
-                        if moved_to is None and any(True for _ in self.parameters()):
-                            param_dev = next(self.parameters()).device
-                            if param_dev != feat.device:
-                                self.to(feat.device)
-                        moved_to = feat.device
-                        all_node_feats.append(self._to_embed_dim(feat, str(ntype)))
-            else:
-                # Homogeneous fallback
-                feat = getattr(g, "ndata", {}).get("feat") if hasattr(g, "ndata") else None
-                if isinstance(feat, torch.Tensor) and feat.numel() > 0:
-                    if moved_to is None and any(True for _ in self.parameters()):
-                        param_dev = next(self.parameters()).device
-                        if param_dev != feat.device:
-                            self.to(feat.device)
-                    moved_to = feat.device
-                    all_node_feats.append(self._to_embed_dim(feat, "_homogeneous"))
-        if all_node_feats:
-            # [total_nodes, self.embedding_dim]
-            combined_feats = torch.cat(all_node_feats, dim=0)
-            torch.manual_seed(self.seed)  # For reproducible queries
-            queries = [torch.randn(self.embedding_dim, dtype=torch.float32,
-                                   device=combined_feats.device) for _ in range(self.num_heads)]
-            pooled = []
-            for query in queries:
-                attn_logits = combined_feats @ query  # [total_nodes]
-                attn = torch.softmax(attn_logits, dim=0)  # [total_nodes]
-                # [self.embedding_dim]
-                pooled.append((attn.unsqueeze(1) * combined_feats).sum(dim=0))
-            # [self.num_heads * self.embedding_dim]
-            graph_embedding = torch.cat(pooled, dim=0)
+            out.append(str(x))
+    return tuple(out)
+
+
+def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
+    """Produce a standardized heterograph using only canonical node types.
+
+    Behavior summary:
+    - Ensure presence of cfg_node and ast_node (0 nodes if missing).
+    - Add all requested canonical edge types (0 edges if missing).
+    - Populate node/edge 'feat' with copied tensors when available, otherwise zeros.
+    """
+    if g is None or not hasattr(g, "ntypes") or not hasattr(g, "canonical_etypes"):
+        return g
+
+    # Normalize relation tuples to simple string triples
+    def _to_rel(r):
+        r = _rel_to_str_tuple(r)
+        return r if (isinstance(r, tuple) and len(r) == 3) else None
+
+    try:
+        req_rels = [r for r in (_to_rel(x)
+                                for x in (required_rel_names or [])) if r]
+    except Exception:
+        req_rels = []
+
+    if not req_rels:
+        try:
+            req_rels = [r for r in (_to_rel(x) for x in list(
+                getattr(g, "canonical_etypes", []))) if r]
+        except Exception:
+            req_rels = []
+
+    required_ntypes = set(["cfg_node", "ast_node"])
+    for (s, _, d) in req_rels:
+        required_ntypes.add(s)
+        required_ntypes.add(d)
+
+    # Node counts (0 if missing)
+    num_nodes_dict = {nt: int(g.num_nodes(
+        nt)) if nt in g.ntypes else 0 for nt in sorted(required_ntypes)}
+
+    # Build edge data mapping for heterograph creation
+    data_dict = {}
+    existing = set(getattr(g, "canonical_etypes", []))
+    for rel in req_rels:
+        s, e, d = rel
+        if s not in num_nodes_dict or d not in num_nodes_dict:
+            continue
+        if rel in existing:
+            try:
+                src, dst = g.edges(etype=rel)
+            except Exception:
+                src = torch.empty((0,), dtype=torch.int64)
+                dst = torch.empty((0,), dtype=torch.int64)
         else:
-            # Fallback if no features
-            graph_embedding = torch.zeros(
-                self.num_heads * self.embedding_dim, dtype=torch.float32)
-        return graph_embedding
+            src = torch.empty((0,), dtype=torch.int64)
+            dst = torch.empty((0,), dtype=torch.int64)
+        data_dict[rel] = (src, dst)
+
+    # Ensure at least one relation exists for DGL heterograph creation
+    if not data_dict:
+        dummy_rel = ("cfg_node", "_dummy", "cfg_node")
+        data_dict[dummy_rel] = (torch.empty(
+            (0,), dtype=torch.int64), torch.empty((0,), dtype=torch.int64))
+
+    new_g = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict)
+
+    # Preserve id maps
+    for attr in ("contract_id_to_name", "function_id_to_name"):
+        if hasattr(g, attr):
+            try:
+                setattr(new_g, attr, getattr(g, attr))
+            except Exception:
+                pass
+
+    cfg_dim = int(embedding_dims.get("cfg_node", 0) or 0)
+    ast_dim = int(embedding_dims.get("ast_node", 0) or 0)
+    edge_dim = int(embedding_dims.get("edge", 0) or 0)
+
+    # Node features: copy when possible, otherwise create zeros (stable shapes)
+    for ntype in new_g.ntypes:
+        n = int(new_g.num_nodes(ntype))
+        if n == 0:
+            if ntype == "cfg_node" and cfg_dim > 0:
+                new_g.nodes[ntype].data["feat"] = torch.zeros(
+                    (0, cfg_dim), dtype=torch.float32)
+            elif ntype == "ast_node" and ast_dim > 0:
+                new_g.nodes[ntype].data["feat"] = torch.zeros(
+                    (0, ast_dim), dtype=torch.float32)
+            continue
+
+        feat = None
+        if ntype in g.ntypes:
+            try:
+                feat = g.nodes[ntype].data.get("feat")
+            except Exception:
+                feat = None
+        if isinstance(feat, torch.Tensor) and feat.shape[0] == n:
+            new_g.nodes[ntype].data["feat"] = feat.to(torch.float32)
+        else:
+            dim = cfg_dim if ntype == "cfg_node" else (
+                ast_dim if ntype == "ast_node" else 0)
+            if dim > 0:
+                new_g.nodes[ntype].data["feat"] = torch.zeros(
+                    (n, dim), dtype=torch.float32)
+
+    # Edge features: copy when possible, otherwise zeros
+    for rel in new_g.canonical_etypes:
+        m = int(new_g.num_edges(rel))
+        if m == 0:
+            continue
+        feat = None
+        if rel in existing:
+            try:
+                feat = g.edges[rel].data.get("feat")
+            except Exception:
+                feat = None
+        if isinstance(feat, torch.Tensor) and feat.shape[0] == m:
+            new_g.edges[rel].data["feat"] = feat.to(torch.float32)
+        else:
+            if edge_dim > 0:
+                new_g.edges[rel].data["feat"] = torch.zeros(
+                    (m, edge_dim), dtype=torch.float32)
+
+    return new_g
 
 
 class CustomDataset(Dataset):
@@ -218,6 +200,8 @@ class CustomDataset(Dataset):
 
         self.dataset_graph = {}
         self.dataset_label = {}
+        # Stage 1/2 optional embedding cache (loaded on-demand in postprocessing).
+        self.dataset_embedding = {}
         self.is_test = is_test
 
         # Initialize Processor components only if needed (Force Reload or Missing Data)
@@ -263,25 +247,35 @@ class CustomDataset(Dataset):
             tokenizer=self.tokenizer,
             model=self.embedding_model,
             device=self.device,
-            batch_size=16,
+            batch_size=512,
             checkpoint_dir="./checkpoints/processed_graphs",
         )
         self.embedding_dims = self.CPG_Proccessor.embedding_dims
 
-        # Stage1/2 embedder: use full node feat widths via projection to 768,
-        # keeping downstream embedding size stable at 3072.
         node_in_dims = {}
-        for k in ("cfg_node", "ast_node"):
-            if k in self.embedding_dims:
-                node_in_dims[k] = int(self.embedding_dims[k])
-        self.graph_embedder = GraphEmbedder(
-            embedding_dim=768, num_heads=4, node_in_dims=node_in_dims
-        ).to(self.device)
+        if "cfg_node" in self.embedding_dims:
+            node_in_dims["cfg_node"] = int(self.embedding_dims["cfg_node"])
+        if "ast_node" in self.embedding_dims:
+            node_in_dims["ast_node"] = int(self.embedding_dims["ast_node"])
+
         print(f"  Embedding Dims: {json.dumps(self.embedding_dims, indent=2)}")
         if source == "DAppSCAN":
             self._fetch_and_process_DAppSCAN_data(
                 force_reload=needs_processing)
             self.postprocessing()
+
+    def _stage_file_paths(self, stage: int):
+        """Returns (graph_path, label_path, embedding_path)."""
+        base_filename = "DAppSCAN_dataset.pt"
+        base_path = os.path.join(self.save_load_dir, base_filename)
+        test_suffix = "test" if self.is_test else ""
+        g_path = base_path.replace(
+            ".pt", f"_stage{stage}{test_suffix}_graph.pt")
+        l_path = base_path.replace(
+            ".pt", f"_stage{stage}{test_suffix}_label.pt")
+
+    
+        return g_path, l_path
 
     def set_active_stage(self, stage):
         self.stage = stage
@@ -339,9 +333,11 @@ class CustomDataset(Dataset):
             logger.error(f"Error in data processing: {e}")
             traceback.print_exc()
 
+
     def _save_data(self, base_path):
         """Saves distinct files for each stage."""
         try:
+            os.makedirs(os.path.dirname(base_path), exist_ok=True)
             logger.info("Saving 3-stage cascade data to disk...")
             for s in [1, 2, 3]:
                 key = f"stage{s}"
@@ -393,9 +389,7 @@ class CustomDataset(Dataset):
         """Loads the current stage file."""
         s = self.stage
         print(f"Attempting to load Stage {s} data from disk...")
-        test_suffix = "test" if self.is_test else ""
-        g_path = base_path.replace(".pt", f"_stage{s}{test_suffix}_graph.pt")
-        l_path = base_path.replace(".pt", f"_stage{s}{test_suffix}_label.pt")
+        g_path, l_path = self._stage_file_paths(s)
 
         if os.path.exists(g_path) and os.path.exists(l_path):
             logger.info(f"Loading Stage {s} from disk...")
@@ -406,17 +400,11 @@ class CustomDataset(Dataset):
                 l_path, map_location="cpu", weights_only=False
             )
 
-            # Deflatten: Group by project (supports both new triple format and legacy combined-key format)
+            # Deflatten: Group by project
             graphs_by_project = {}
             for item in flattened_graphs:
                 if isinstance(item, (list, tuple)) and len(item) == 3:
                     p_name, subkey, g = item
-                elif isinstance(item, (list, tuple)) and len(item) == 2:
-                    # HARD: reject legacy combined-key format (unsafe to parse).
-                    logger.warning(
-                        f"Stage {s} graph file is legacy 2-tuple format; refusing to load. Please reprocess with --force_reload."
-                    )
-                    return False
                 else:
                     logger.warning(
                         f"Unexpected graph item format: {type(item)}")
@@ -427,11 +415,6 @@ class CustomDataset(Dataset):
             for item in flattened_labels:
                 if isinstance(item, (list, tuple)) and len(item) == 3:
                     p_name, subkey, lbl = item
-                elif isinstance(item, (list, tuple)) and len(item) == 2:
-                    logger.warning(
-                        f"Stage {s} label file is legacy 2-tuple format; refusing to load. Please reprocess with --force_reload."
-                    )
-                    return False
                 else:
                     logger.warning(
                         f"Unexpected label item format: {type(item)}")
@@ -442,26 +425,13 @@ class CustomDataset(Dataset):
             self.dataset_graph[s] = graphs_by_project
             self.dataset_label[s] = labels_by_project
 
-            # Validate schema: labels must cover graphs for this stage.
-            # If not, treat saved files as incompatible (likely produced by older pipeline).
-            missing_total = 0
-            total_graph_items = 0
-            for p_name, g_dict in graphs_by_project.items():
-                if not isinstance(g_dict, dict):
-                    continue
-                graph_keys = set(g_dict.keys())
-                total_graph_items += len(graph_keys)
-                label_keys = set(labels_by_project.get(p_name, {}).keys())
-                missing_total += len(graph_keys - label_keys)
-
-            if total_graph_items > 0 and missing_total > 0:
-                logger.warning(
-                    f"Stage {s} saved data appears incompatible: missing {missing_total}/{total_graph_items} labels. Will reprocess."
-                )
-                # Clear any partially loaded data for this stage.
-                self.dataset_graph.pop(s, None)
-                self.dataset_label.pop(s, None)
-                return False
+            # Collect rel_names from loaded graphs
+            all_rels = set()
+            for p, gdict in graphs_by_project.items():
+                for sub, g in gdict.items():
+                    if hasattr(g, 'canonical_etypes'):
+                        all_rels.update(g.canonical_etypes)
+            self.CPG_Proccessor.rel_names = list(all_rels)
 
             logger.info(
                 f"  Loaded {len(graphs_by_project)} projects for Stage {s}."
@@ -489,8 +459,10 @@ class CustomDataset(Dataset):
         raw_labels = self.dataset_label[self.stage]
 
         # Accept either dicts keyed by project or list[(project, dict)] (legacy/in-memory).
-        graphs_by_project = dict(raw_graphs) if isinstance(raw_graphs, list) else raw_graphs
-        labels_by_project = dict(raw_labels) if isinstance(raw_labels, list) else raw_labels
+        graphs_by_project = dict(raw_graphs) if isinstance(
+            raw_graphs, list) else raw_graphs
+        labels_by_project = dict(raw_labels) if isinstance(
+            raw_labels, list) else raw_labels
 
         if not isinstance(graphs_by_project, dict) or not isinstance(labels_by_project, dict):
             logger.error(
@@ -498,126 +470,150 @@ class CustomDataset(Dataset):
             )
             return
 
-        for p_name_g, graphs_data in graphs_by_project.items():
-            labels_data = labels_by_project.get(p_name_g, {})
+        total_items = 0
+        for _p, _gdict in graphs_by_project.items():
+            if isinstance(_gdict, dict):
+                total_items += len(_gdict)
 
-            if not isinstance(graphs_data, dict) or not isinstance(labels_data, dict):
-                logger.warning(
-                    f"Unexpected per-project data types for {p_name_g}: graphs={type(graphs_data)} labels={type(labels_data)}"
-                )
-                continue
+        pbar = None
+        if total_items > 0:
+            pbar = tqdm(
+                total=total_items,
+                desc=f"Postprocessing Stage {self.stage}",
+                unit="item",
+            )
 
-            # Align graph+label per subkey (so __getitem__ is always consistent)
-            for subkey, graph_data in graphs_data.items():
-                full_key = f"{p_name_g}@{subkey}"
+        try:
+            for p_name_g, graphs_data in graphs_by_project.items():
+                labels_data = labels_by_project.get(p_name_g, {})
 
-                lbl = labels_data.get(subkey)
-                if lbl is None:
-                    raise ValueError(
-                        f"Missing label for {full_key}. This indicates stage graph/label keys are inconsistent."
+                if not isinstance(graphs_data, dict) or not isinstance(labels_data, dict):
+                    logger.warning(
+                        f"Unexpected per-project data types for {p_name_g}: graphs={type(graphs_data)} labels={type(labels_data)}"
                     )
+                    continue
 
-                g = normalize_graph_keys(graph_data)
-                if self.stage in [1, 2]:
-                    # HARD: stage1/2 labels must be binary.
-                    if isinstance(lbl, bool):
-                        lbl = int(lbl)
-                    if not isinstance(lbl, int) or lbl not in (0, 1):
+                # Align graph+label per subkey (so __getitem__ is always consistent)
+                for subkey, graph_data in graphs_data.items():
+                    full_key = f"{p_name_g}@{subkey}"
+
+                    lbl = labels_data.get(subkey)
+                    if lbl is None:
                         raise ValueError(
-                            f"Stage {self.stage} label must be int 0/1 for {full_key}, got {lbl} ({type(lbl)})"
-                        )
-                    g = g.to(self.device)
-                    g = self.graph_embedder(g)
-                    if not isinstance(g, torch.Tensor) or g.dim() != 1:
-                        raise TypeError(
-                            f"Stage {self.stage} embedder output must be 1D tensor for {full_key}, got {type(g)}"
-                        )
-                    expected_dim = int(self.graph_embedder.num_heads * self.graph_embedder.embedding_dim)
-                    if g.shape[0] != expected_dim:
-                        raise ValueError(
-                            f"Stage {self.stage} embedding dim mismatch for {full_key}: got {g.shape[0]} expected {expected_dim}"
-                        )
-                else:
-                    # Stage 3: fail-fast contract check: label rows must match node counts.
-                    if not hasattr(g, "ntypes"):
-                        raise TypeError(f"Stage 3 expects a DGL heterograph, got {type(g)} for {full_key}")
-
-                    if not isinstance(lbl, dict) or ("cfg_node" not in lbl or "ast_node" not in lbl):
-                        raise TypeError(
-                            f"Stage 3 label must be dict with cfg_node/ast_node for {full_key}, got {type(lbl)}"
+                            f"Missing label for {full_key}. This indicates stage graph/label keys are inconsistent."
                         )
 
-                    expected_dim = len(getattr(_graph_utils, "OWASP_VULN", []))
-                    if expected_dim <= 0:
-                        raise RuntimeError("OWASP_VULN is not defined or empty")
+                    if self.stage in [1, 2]:
+                        g = graph_data
 
-                    def _validate_label_rows(rows, node_type: str):
-                        if rows is None:
-                            return
-                        if not isinstance(rows, list):
+                        if not hasattr(g, "ntypes"):
                             raise TypeError(
-                                f"Stage 3 {node_type} labels must be a list for {full_key}, got {type(rows)}"
+                                f"Stage 1/2 expects a DGL heterograph, got {type(g)} for {full_key}")
+
+
+                        if not isinstance(lbl, int) or lbl not in (0, 1):
+                            raise ValueError(
+                                f"Stage {self.stage} label must be int 0/1 for {full_key}, got {lbl} ({type(lbl)})"
                             )
-                        for i, row in enumerate(rows[:5]):
-                            if not isinstance(row, (list, tuple)):
-                                raise TypeError(
-                                    f"Stage 3 {node_type}[{i}] must be list/tuple for {full_key}, got {type(row)}"
-                                )
-                            if len(row) != expected_dim:
-                                raise ValueError(
-                                    f"Stage 3 {node_type}[{i}] dim mismatch for {full_key}: got {len(row)} expected {expected_dim}"
-                                )
-                            bad = [v for v in row if v not in (0, 1, 0.0, 1.0)]
-                            if bad:
-                                raise ValueError(
-                                    f"Stage 3 {node_type}[{i}] has non-binary values for {full_key} (sample={bad[:5]})"
-                                )
+                    else:
+                        g = graph_data
+                        # Stage 3: fail-fast contract check: label rows must match node counts.
+                        if not hasattr(g, "ntypes"):
+                            raise TypeError(
+                                f"Stage 3 expects a DGL heterograph, got {type(g)} for {full_key}")
 
-                    _validate_label_rows(lbl.get("cfg_node"), "cfg_node")
-                    _validate_label_rows(lbl.get("ast_node"), "ast_node")
+                        if not isinstance(lbl, dict) or ("cfg_node" not in lbl or "ast_node" not in lbl):
+                            raise TypeError(
+                                f"Stage 3 label must be dict with cfg_node/ast_node for {full_key}, got {type(lbl)}"
+                            )
 
-                    def _pick_ntype(graph, candidates):
-                        for cand in candidates:
-                            if cand in graph.ntypes:
-                                return cand
-                        return None
+                        expected_dim = len(getattr(_graph_utils, "OWASP_VULN", []))
 
-                    cfg_ntype = _pick_ntype(g, ["cfg_node", "node_cfg"])
-                    ast_ntype = _pick_ntype(g, ["ast_node", "node_ast"])
-                    cfg_nodes = g.num_nodes(cfg_ntype) if cfg_ntype is not None else 0
-                    ast_nodes = g.num_nodes(ast_ntype) if ast_ntype is not None else 0
 
-                    cfg_rows = int(lbl.get("cfg_node", []) and len(lbl.get("cfg_node", [])) or 0)
-                    ast_rows = int(lbl.get("ast_node", []) and len(lbl.get("ast_node", [])) or 0)
-                    if cfg_rows != cfg_nodes:
-                        raise ValueError(
-                            f"Stage 3 contract mismatch for {full_key}: cfg labels rows {cfg_rows} != {cfg_ntype} nodes {cfg_nodes}"
+                        cfg_nodes = g.num_nodes("cfg_node") if "cfg_node" in g.ntypes else 0
+                        ast_nodes = g.num_nodes("ast_node") if "ast_node" in g.ntypes else 0
+
+                        cfg_rows = int(lbl.get("cfg_node", []) and len(
+                            lbl.get("cfg_node", [])) or 0)
+                        ast_rows = int(lbl.get("ast_node", []) and len(
+                            lbl.get("ast_node", [])) or 0)
+                        
+                        if cfg_rows != cfg_nodes:
+                            raise ValueError(
+                                f"Stage 3 contract mismatch for CFG {full_key}"
+                            )
+                        if ast_rows != ast_nodes:
+                            raise ValueError(
+                                f"Stage 3 contract mismatch for AST {full_key}"
+                            )
+
+                        # Standardize heterograph schema so batching never drops data.
+                        try:
+                            g = standardize_stage3_heterograph(
+                                g,
+                                getattr(self.CPG_Proccessor,
+                                        "rel_names", None),
+                                self.embedding_dims,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Stage 3 schema standardization failed for {full_key}: {e}")
+                            if pbar is not None:
+                                pbar.update(1)
+                            continue
+
+                        # Materialize label tensors with stable 2D shape [N, expected_dim]
+                        # (torch.tensor([]) would otherwise create a 1D empty tensor).
+                        cfg_list = lbl.get("cfg_node", []) or []
+                        ast_list = lbl.get("ast_node", []) or []
+                        cfg_tensor = torch.tensor(
+                            cfg_list, dtype=torch.float32)
+                        ast_tensor = torch.tensor(
+                            ast_list, dtype=torch.float32)
+
+                        if cfg_tensor.numel() == 0:
+                            cfg_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+                        elif cfg_tensor.dim() == 1 and cfg_tensor.numel() == expected_dim:
+                            cfg_tensor = cfg_tensor.unsqueeze(0)
+
+                        if ast_tensor.numel() == 0:
+                            ast_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+                        elif ast_tensor.dim() == 1 and ast_tensor.numel() == expected_dim:
+                            ast_tensor = ast_tensor.unsqueeze(0)
+
+
+                    if self.stage in [1, 2]:
+                        g = standardize_stage3_heterograph(
+                            g,
+                            getattr(self.CPG_Proccessor, "rel_names", None),
+                            self.embedding_dims,
                         )
-                    if ast_rows != ast_nodes:
-                        raise ValueError(
-                            f"Stage 3 contract mismatch for {full_key}: ast labels rows {ast_rows} != {ast_ntype} nodes {ast_nodes}"
+
+                    dataset_graph_temp.append((full_key, g))
+
+                    if self.stage in [1, 2]:
+                        dataset_label_temp.append(
+                            (full_key, torch.tensor(lbl, dtype=torch.float32))
+                        )
+                    else:
+                        dataset_label_temp.append(
+                            (
+                                full_key,
+                                {
+                                    "cfg_node": cfg_tensor,
+                                    "ast_node": ast_tensor,
+                                },
+                            )
                         )
 
-                dataset_graph_temp.append((full_key, g))
+                    if pbar is not None:
+                        pbar.update(1)
 
-                if self.stage in [1, 2]:
-                    dataset_label_temp.append(
-                        (full_key, torch.tensor(lbl, dtype=torch.float32))
-                    )
-                else:
-                    dataset_label_temp.append(
-                        (
-                            full_key,
-                            {
-                                "cfg_node": torch.tensor(
-                                    lbl.get("cfg_node", []), dtype=torch.float32
-                                ),
-                                "ast_node": torch.tensor(
-                                    lbl.get("ast_node", []), dtype=torch.float32
-                                ),
-                            },
-                        )
-                    )
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         if len(dataset_graph_temp) != len(dataset_label_temp):
             logger.warning(
@@ -638,7 +634,7 @@ class CustomDataset(Dataset):
             label = self.dataset_label[idx][1]
             if self.dataset_label[idx][0] != k:
                 raise ValueError("Graph and label keys do not match.")
-            return {"embeddings": g, "graph_labels": {k: label}, "project_name": p_name}
+            return {"graph": g, "graph_labels": {k: label}, "project_name": p_name}
         else:
             label_key, label_dict = self.dataset_label[idx]
             if label_key != k:
@@ -661,15 +657,22 @@ def custom_collate(batch, stage=3):
         if not batch:
             return None
 
-        # 2. Batch Graphs (All graphs have consistent schema from CPG_Processor)
-        graphs = [b["graph"] for b in batch if "graph" in b]
-        batched_graph = dgl.batch(graphs) if graphs else None
+        # 2. Batch Graphs
+        batched_graph = None
+        kept_batch = batch
 
-        # Preserve metadata for Stage 1/2 label matching
-        # Store per-graph ID-to-name mappings
+
+        graphs = [b["graph"] for b in batch if isinstance(
+            b, dict) and b.get("graph") is not None]
+        if not graphs:
+            return None
+
+        # All Stage 3 graphs should have been standardized during dataset postprocessing.
+        batched_graph = dgl.batch(graphs)
+
+        # Preserve metadata
         id_to_name_maps = []
         for g in graphs:
-            # Try to get the metadata from original graph
             contract_map = getattr(g, "contract_id_to_name", None)
             function_map = getattr(g, "function_id_to_name", None)
             id_to_name_maps.append(
@@ -677,8 +680,8 @@ def custom_collate(batch, stage=3):
         batched_graph.id_to_name_maps = id_to_name_maps
 
         # 3. Collate Labels
-        def collate_key(key):
-            items = [b.get(key) for b in batch if b.get(key) is not None]
+        def collate_key(key, items_batch):
+            items = [b.get(key) for b in items_batch if b.get(key) is not None]
 
             # A. Tensor Mode (Stage 3 Node Labels) -> Concat
             if all(isinstance(x, torch.Tensor) for x in items):
@@ -690,25 +693,34 @@ def custom_collate(batch, stage=3):
         # Stage-specific collation
         if stage == 3:
             labels = {
-                "cfg_labels": collate_key("cfg_labels"),
-                "ast_labels": collate_key("ast_labels"),
+                "cfg_labels": collate_key("cfg_labels", kept_batch),
+                "ast_labels": collate_key("ast_labels", kept_batch),
             }
         else:
-            # Stage 1/2: Embeddings and labels
-            embeddings = torch.stack([b["embeddings"] for b in batch])
             labels = {"graph_labels": [b.get("graph_labels") for b in batch]}
 
         return {
-            "graph": batched_graph if stage == 3 else None,
-            "embeddings": embeddings if stage != 3 else None,
+            "graph": batched_graph,
             **labels,
-            "project_names": [b["project_name"] for b in batch],
+            "project_names": [b["project_name"] for b in (kept_batch if stage == 3 else batch)],
         }
     except Exception as e:
         logger.error(f"Error in custom_collate: {e}")
         return None
 
 
+
+
+
+
+
+
+
+
+
+########################################################
+##################### TEST CODE ########################
+########################################################
 if __name__ == "__main__":
     # Command Line Interface for Data Processing
     parser = argparse.ArgumentParser(description="DAppSCAN Dataset Processor")
@@ -749,8 +761,10 @@ if __name__ == "__main__":
         if not (os.path.exists(g_path) and os.path.exists(l_path)):
             return None, None
 
-        flattened_graphs = torch.load(g_path, map_location="cpu", weights_only=False)
-        flattened_labels = torch.load(l_path, map_location="cpu", weights_only=False)
+        flattened_graphs = torch.load(
+            g_path, map_location="cpu", weights_only=False)
+        flattened_labels = torch.load(
+            l_path, map_location="cpu", weights_only=False)
 
         graphs_by_project = {}
         for item in flattened_graphs:
@@ -758,7 +772,7 @@ if __name__ == "__main__":
                 p_name, subkey, g = item
             else:
                 raise ValueError(
-                    f"Unexpected graph item format in {g_path}: {type(item)} len={len(item) if isinstance(item,(list,tuple)) else 'n/a'}"
+                    f"Unexpected graph item format in {g_path}: {type(item)} len={len(item) if isinstance(item, (list, tuple)) else 'n/a'}"
                 )
             graphs_by_project.setdefault(p_name, {})[subkey] = g
 
@@ -768,7 +782,7 @@ if __name__ == "__main__":
                 p_name, subkey, lbl = item
             else:
                 raise ValueError(
-                    f"Unexpected label item format in {l_path}: {type(item)} len={len(item) if isinstance(item,(list,tuple)) else 'n/a'}"
+                    f"Unexpected label item format in {l_path}: {type(item)} len={len(item) if isinstance(item, (list, tuple)) else 'n/a'}"
                 )
             labels_by_project.setdefault(p_name, {})[subkey] = lbl
 
@@ -782,7 +796,8 @@ if __name__ == "__main__":
 
         projects = list(graphs_by_project.keys())
         print(f"\nFinal Results Schema (from saved stage{stage} files):")
-        print(f"  stage{stage}: graphs={len(projects)}, labels={len(labels_by_project)}")
+        print(
+            f"  stage{stage}: graphs={len(projects)}, labels={len(labels_by_project)}")
         if not projects:
             return
 
@@ -825,7 +840,8 @@ if __name__ == "__main__":
         n = len(ds)
         print(f"Stage {stage} postprocessed samples: {n}")
         if n == 0:
-            raise AssertionError(f"Stage {stage} produced 0 samples after postprocessing")
+            raise AssertionError(
+                f"Stage {stage} produced 0 samples after postprocessing")
 
         checks = min(n, max_checks)
         for i in range(checks):
@@ -843,20 +859,24 @@ if __name__ == "__main__":
                     )
             else:
                 if dgl is None:
-                    raise RuntimeError("DGL is required to validate stage 3 graphs")
+                    raise RuntimeError(
+                        "DGL is required to validate stage 3 graphs")
                 g = item["graph"]
                 cfg = item["cfg_labels"]
                 ast = item["ast_labels"]
+
                 def _pick_ntype(graph, candidates):
                     for cand in candidates:
                         if cand in graph.ntypes:
                             return cand
                     return None
 
-                cfg_ntype = _pick_ntype(g, ["cfg_node", "node_cfg"])
-                ast_ntype = _pick_ntype(g, ["ast_node", "node_ast"])
-                cfg_nodes = g.num_nodes(cfg_ntype) if cfg_ntype is not None else 0
-                ast_nodes = g.num_nodes(ast_ntype) if ast_ntype is not None else 0
+                cfg_ntype = _pick_ntype(g, ["cfg_node"])
+                ast_ntype = _pick_ntype(g, ["ast_node"])
+                cfg_nodes = g.num_nodes(
+                    cfg_ntype) if cfg_ntype is not None else 0
+                ast_nodes = g.num_nodes(
+                    ast_ntype) if ast_ntype is not None else 0
                 if cfg.shape[0] != cfg_nodes:
                     raise AssertionError(
                         f"Stage 3: cfg_labels rows {cfg.shape[0]} != {cfg_ntype} {cfg_nodes}"
@@ -869,7 +889,8 @@ if __name__ == "__main__":
         print(f"  Validation OK on {checks} samples")
 
     # One processing pass generates and saves all 3 stages.
-    _ = CustomDataset(stage=3, force_reload=args.force_reload, is_test=args.test)
+    _ = CustomDataset(
+        stage=3, force_reload=args.force_reload, is_test=args.test)
 
     # Print and assert raw saved schema for all 3 stages.
     for s in [1, 2, 3]:
@@ -882,42 +903,53 @@ if __name__ == "__main__":
 
         # Print actual sample data (not just schema) for the first few items.
         print(f"\nStage {s} sample data (first 2 items):")
-        for i in range(min(30,len(ds))):
+        for i in range(min(30, len(ds))):
             item = ds[i]
             if s in [1, 2]:
+                g = item["graph"]
                 # Embedding is a real tensor from GraphEmbedder
                 key = next(iter(item["graph_labels"].keys()))
-                emb = item["embeddings"]
                 lbl = item["graph_labels"][key]
-                emb_flat = emb.flatten()
-                preview = emb_flat[:16].detach().cpu().tolist() if isinstance(emb, torch.Tensor) else []
                 print(f"  [{i}] key={key}")
-                if isinstance(emb, torch.Tensor):
-                    print(
-                        f"      embedding: shape={tuple(emb.shape)} preview[:16]={preview} mean={emb.mean().item():.6f} std={emb.std().item():.6f}"
-                    )
-                else:
-                    print(f"      embedding: type={type(emb)}")
-                print(f"      label: {float(lbl.detach().cpu().item()) if isinstance(lbl, torch.Tensor) else lbl}")
-            else:
-                g = item["graph"]
-                cfg = item["cfg_labels"]
-                ast = item["ast_labels"]
-                print(f"  [{i}] project={item['project_name']} ntypes={list(g.ntypes)}")
+                
                 for ntype in g.ntypes:
                     n = g.num_nodes(ntype)
                     feat = g.nodes[ntype].data.get("feat")
-                    feat_shape = tuple(feat.shape) if isinstance(feat, torch.Tensor) else None
+                    feat_shape = tuple(feat.shape) if isinstance(
+                        feat, torch.Tensor) else None
                     feat_preview = (
                         feat[0, :8].detach().cpu().tolist()
                         if isinstance(feat, torch.Tensor) and feat.numel() > 0
                         else None
                     )
-                    print(f"      {ntype}: nodes={n} feat_shape={feat_shape} feat0[:8]={feat_preview}")
+                    print(
+                        f"      {ntype}: nodes={n} feat_shape={feat_shape} feat0[:8]={feat_preview}")
+            else:
+                g = item["graph"]
+                cfg = item["cfg_labels"]
+                ast = item["ast_labels"]
+                print(
+                    f"  [{i}] project={item['project_name']} ntypes={list(g.ntypes)}")
+                for ntype in g.ntypes:
+                    n = g.num_nodes(ntype)
+                    feat = g.nodes[ntype].data.get("feat")
+                    feat_shape = tuple(feat.shape) if isinstance(
+                        feat, torch.Tensor) else None
+                    feat_preview = (
+                        feat[0, :8].detach().cpu().tolist()
+                        if isinstance(feat, torch.Tensor) and feat.numel() > 0
+                        else None
+                    )
+                    print(
+                        f"      {ntype}: nodes={n} feat_shape={feat_shape} feat0[:8]={feat_preview}")
 
-                cfg_preview = cfg[:2].detach().cpu().tolist() if isinstance(cfg, torch.Tensor) else None
-                ast_preview = ast[:2].detach().cpu().tolist() if isinstance(ast, torch.Tensor) else None
-                print(f"      cfg_labels: shape={tuple(cfg.shape)} first2={cfg_preview}")
-                print(f"      ast_labels: shape={tuple(ast.shape)} first2={ast_preview}")
+                cfg_preview = cfg[:2].detach().cpu().tolist(
+                ) if isinstance(cfg, torch.Tensor) else None
+                ast_preview = ast[:2].detach().cpu().tolist(
+                ) if isinstance(ast, torch.Tensor) else None
+                print(
+                    f"      cfg_labels: shape={tuple(cfg.shape)} first2={cfg_preview}")
+                print(
+                    f"      ast_labels: shape={tuple(ast.shape)} first2={ast_preview}")
 
     print("\n✅ All 3 stages are schema-consistent and postprocessing-aligned.")
