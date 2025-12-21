@@ -26,15 +26,15 @@ class ColoredFormatter(logging.Formatter):
         "YELLOW": Fore.YELLOW + Style.BRIGHT,
         "PURPLE": Fore.MAGENTA + Style.BRIGHT, # system messages
     }
-    def regex_tag(self, msg: str) -> list:
+    def regex_tag(self, msg: str):
         # extract one [TAG] from message if present
         if msg.startswith('['):
             end_idx = msg.find(']')
             if end_idx != -1:
                 tag = msg[1:end_idx]
                 rest_msg = msg[end_idx+1:].strip()
-                return tag, rest_msg
-        return None, msg
+                return tag, rest_msg # type: ignore
+        return None, msg # type: ignore
 
     def format(self, record):
         """
@@ -60,8 +60,8 @@ class ColoredFormatter(logging.Formatter):
             msg = res_msg # Use the message without the tag
 
         # Format: [YYYY-MM-DD HH:MM:SS][emulator][filename][function][message]
-        log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_format = f"[{log_time}][{record.filename}][{record.funcName}] - {color}{msg}{Style.RESET_ALL}"
+        #log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_format = f"{record.filename}][{record.funcName}] - {color}{msg}{Style.RESET_ALL}"
         return log_format
 
 

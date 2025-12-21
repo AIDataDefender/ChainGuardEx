@@ -10,7 +10,7 @@ import os
 import traceback
 import dgl
 import argparse
-
+from pathlib import Path
 
 # Add the workspace root to Python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
@@ -19,12 +19,13 @@ try:
     from experiments.the_utils.logger import setup_logger
     from experiments.cpg_processor import CPG_Processor
     from experiments.the_utils import graph_utils as _graph_utils
-    from Data.DAppSCAN.f6_DAppSCAN_fetch_data_adapter import f6_fetch_DAppSCAN_data
 except Exception:
     from the_utils.logger import setup_logger
     from cpg_processor import CPG_Processor
     from the_utils import graph_utils as _graph_utils
-    from Data.DAppSCAN.f6_DAppSCAN_fetch_data_adapter import f6_fetch_DAppSCAN_data
+
+from Data.DAppSCAN.f6_DAppSCAN_fetch_data_adapter import f6_fetch_DAppSCAN_data
+from f6_fetch_MANDO_data_adapter import f6_fetch_MANDO_data
 
 
 # Logging Setup
@@ -49,21 +50,69 @@ def _rel_to_str_tuple(rel):
     return tuple(out)
 
 
-def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
-    """Produce a standardized heterograph using only canonical node types.
+def standardize_heterograph(
+    g,
+    required_rel_names,
+    embedding_dims,
+    *,
+    filter_out_node_types=None,
+    filter_out_edge_types=None,
+    drop_non_schema_match=False,
+    report=False,
+    fill_strategy="zeros",
+    noise_std=0.02,
+):
+    """Produce a standardized heterograph with optional schema filtering.
 
-    Behavior summary:
+    Default behavior (backwards-compatible):
     - Ensure presence of cfg_node and ast_node (0 nodes if missing).
     - Add all requested canonical edge types (0 edges if missing).
     - Populate node/edge 'feat' with copied tensors when available, otherwise zeros.
+
+    Options:
+    - filter_out_node_types: list[str]; remove these node types entirely.
+      Edges whose src/dst node types are removed are also removed.
+    - filter_out_edge_types: list[canonical_etype]; remove these canonical etypes.
+      Accepts tuples like (src, etype, dst); elements are stringified.
+    - drop_non_schema_match: if True AND no explicit filtering is enabled,
+      return None when the input graph does not contain all required node/edge types.
+    - report: print a short report of what was filtered and what remains.
+    - fill_strategy for missing features (when node/edge exists but has no feat):
+      'zeros' (default), 'mean' (mean-vector fill when possible), 'gaussian'
+      (deterministic N(0, noise_std) based on type name).
     """
     if g is None or not hasattr(g, "ntypes") or not hasattr(g, "canonical_etypes"):
         return g
+
+    def _report(msg: str):
+        if report:
+            try:
+                print(msg)
+            except Exception:
+                pass
 
     # Normalize relation tuples to simple string triples
     def _to_rel(r):
         r = _rel_to_str_tuple(r)
         return r if (isinstance(r, tuple) and len(r) == 3) else None
+
+    def _to_ntype(x):
+        try:
+            return str(getattr(x, "value", x))
+        except Exception:
+            return None
+
+    filter_out_node_types = set(
+        _to_ntype(x)
+        for x in (filter_out_node_types or [])
+        if _to_ntype(x)
+    )
+    filter_out_edge_types = set(
+        r
+        for r in (_to_rel(x) for x in (filter_out_edge_types or []))
+        if r
+    )
+    filtering_enabled = bool(filter_out_node_types or filter_out_edge_types)
 
     try:
         req_rels = [r for r in (_to_rel(x)
@@ -78,23 +127,59 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
         except Exception:
             req_rels = []
 
+    # When requested, drop graphs that don't already match schema (no padding/standardization)
+    if drop_non_schema_match and not filtering_enabled:
+        existing_str = set(_to_rel(x) for x in getattr(g, "canonical_etypes", []) or [])
+        existing_str = set(x for x in existing_str if x)
+
+        required_ntypes_check = set(["cfg_node", "ast_node"])
+        for (s, _, d) in req_rels:
+            required_ntypes_check.add(s)
+            required_ntypes_check.add(d)
+
+        missing_ntypes = sorted([nt for nt in required_ntypes_check if nt not in set(map(str, g.ntypes))])
+        missing_rels = sorted([rel for rel in req_rels if rel not in existing_str])
+        if missing_ntypes or missing_rels:
+            _report(
+                "[standardize_heterograph] Dropping non-schema-match graph: "
+                f"missing_ntypes={missing_ntypes} missing_rels={missing_rels}"
+            )
+            return None
+
     required_ntypes = set(["cfg_node", "ast_node"])
     for (s, _, d) in req_rels:
         required_ntypes.add(s)
         required_ntypes.add(d)
 
+    # Apply node-type filtering (remove node types entirely)
+    if filter_out_node_types:
+        required_ntypes -= set(filter_out_node_types)
+
+    if not required_ntypes:
+        _report(
+            "[standardize_heterograph] All node types filtered out; returning None."
+        )
+        return None
+
     # Node counts (0 if missing)
-    num_nodes_dict = {nt: int(g.num_nodes(
-        nt)) if nt in g.ntypes else 0 for nt in sorted(required_ntypes)}
+    num_nodes_dict = {nt: int(g.num_nodes(nt)) if nt in g.ntypes else 0 for nt in sorted(required_ntypes)}
 
     # Build edge data mapping for heterograph creation
     data_dict = {}
     existing = set(getattr(g, "canonical_etypes", []))
+    existing_str = set(_to_rel(x) for x in existing)
+    existing_str = set(x for x in existing_str if x)
+
+    removed_edges_by_filter = []
+    kept_edges = 0
     for rel in req_rels:
         s, e, d = rel
+        if rel in filter_out_edge_types:
+            removed_edges_by_filter.append(rel)
+            continue
         if s not in num_nodes_dict or d not in num_nodes_dict:
             continue
-        if rel in existing:
+        if rel in existing_str:
             try:
                 src, dst = g.edges(etype=rel)
             except Exception:
@@ -104,6 +189,7 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
             src = torch.empty((0,), dtype=torch.int64)
             dst = torch.empty((0,), dtype=torch.int64)
         data_dict[rel] = (src, dst)
+        kept_edges += 1
 
     # Ensure at least one relation exists for DGL heterograph creation
     if not data_dict:
@@ -112,6 +198,19 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
             (0,), dtype=torch.int64), torch.empty((0,), dtype=torch.int64))
 
     new_g = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict)
+
+    if report:
+        try:
+            removed_ntypes = sorted(list(filter_out_node_types))
+        except Exception:
+            removed_ntypes = []
+        _report(
+            "[standardize_heterograph] "
+            f"removed_ntypes={removed_ntypes} removed_etypes={len(removed_edges_by_filter)} "
+            f"kept_ntypes={len(new_g.ntypes)} kept_etypes={kept_edges} "
+            f"total_nodes={sum(int(new_g.num_nodes(nt)) for nt in new_g.ntypes)} "
+            f"total_edges={sum(int(new_g.num_edges(et)) for et in new_g.canonical_etypes)}"
+        )
 
     # Preserve id maps
     for attr in ("contract_id_to_name", "function_id_to_name"):
@@ -124,6 +223,21 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
     cfg_dim = int(embedding_dims.get("cfg_node", 0) or 0)
     ast_dim = int(embedding_dims.get("ast_node", 0) or 0)
     edge_dim = int(embedding_dims.get("edge", 0) or 0)
+
+    def _make_fill(shape, *, key: str, strategy: str, mean_vec=None):
+        strategy = (strategy or "zeros").lower().strip()
+        if strategy == "zeros":
+            return torch.zeros(shape, dtype=torch.float32)
+        if strategy == "mean" and isinstance(mean_vec, torch.Tensor) and mean_vec.numel() > 0:
+            if mean_vec.dim() == 1 and len(shape) == 2 and mean_vec.shape[0] == shape[1]:
+                return mean_vec.to(torch.float32).unsqueeze(0).expand(shape[0], shape[1]).contiguous()
+            # Fallback if mean vector shape mismatches
+        if strategy == "gaussian":
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(42)
+            return (torch.randn(shape, generator=gen, dtype=torch.float32) * float(noise_std)).to(torch.float32)
+        # Default fallback
+        return torch.zeros(shape, dtype=torch.float32)
 
     # Node features: copy when possible, otherwise create zeros (stable shapes)
     for ntype in new_g.ntypes:
@@ -146,11 +260,21 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
         if isinstance(feat, torch.Tensor) and feat.shape[0] == n:
             new_g.nodes[ntype].data["feat"] = feat.to(torch.float32)
         else:
-            dim = cfg_dim if ntype == "cfg_node" else (
-                ast_dim if ntype == "ast_node" else 0)
+            # Prefer known dims; otherwise infer from existing tensor when possible
+            dim = cfg_dim if ntype == "cfg_node" else (ast_dim if ntype == "ast_node" else 0)
+            if dim <= 0 and isinstance(feat, torch.Tensor) and feat.dim() == 2:
+                dim = int(feat.shape[1])
+
             if dim > 0:
-                new_g.nodes[ntype].data["feat"] = torch.zeros(
-                    (n, dim), dtype=torch.float32)
+                mean_vec = None
+                if fill_strategy == "mean" and isinstance(feat, torch.Tensor) and feat.dim() == 2 and feat.shape[1] == dim and feat.numel() > 0:
+                    mean_vec = feat.to(torch.float32).mean(dim=0)
+                new_g.nodes[ntype].data["feat"] = _make_fill(
+                    (n, dim),
+                    key=f"node:{ntype}:{dim}",
+                    strategy=fill_strategy,
+                    mean_vec=mean_vec,
+                )
 
     # Edge features: copy when possible, otherwise zeros
     for rel in new_g.canonical_etypes:
@@ -158,7 +282,7 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
         if m == 0:
             continue
         feat = None
-        if rel in existing:
+        if rel in existing_str:
             try:
                 feat = g.edges[rel].data.get("feat")
             except Exception:
@@ -166,9 +290,21 @@ def standardize_stage3_heterograph(g, required_rel_names, embedding_dims):
         if isinstance(feat, torch.Tensor) and feat.shape[0] == m:
             new_g.edges[rel].data["feat"] = feat.to(torch.float32)
         else:
-            if edge_dim > 0:
-                new_g.edges[rel].data["feat"] = torch.zeros(
-                    (m, edge_dim), dtype=torch.float32)
+            dim = edge_dim
+            if dim <= 0 and isinstance(feat, torch.Tensor) and feat.dim() == 2:
+                dim = int(feat.shape[1])
+
+            if dim > 0:
+                mean_vec = None
+                if fill_strategy == "mean" and isinstance(feat, torch.Tensor) and feat.dim() == 2 and feat.shape[1] == dim and feat.numel() > 0:
+                    mean_vec = feat.to(torch.float32).mean(dim=0)
+                rel_key = ":".join(map(str, _rel_to_str_tuple(rel)))
+                new_g.edges[rel].data["feat"] = _make_fill(
+                    (m, dim),
+                    key=f"edge:{rel_key}:{dim}",
+                    strategy=fill_strategy,
+                    mean_vec=mean_vec,
+                )
 
     return new_g
 
@@ -184,6 +320,7 @@ class CustomDataset(Dataset):
     def __init__(
         self,
         source="DAppSCAN",
+        load_dir="./save_data",
         force_reload=False,
         rand_seed=42,
         stage=3,
@@ -206,23 +343,23 @@ class CustomDataset(Dataset):
 
         # Initialize Processor components only if needed (Force Reload or Missing Data)
         # We check simple existence first to avoid loading heavy models unnecessarily
-        base_filename = "DAppSCAN_dataset.pt"
-        self.save_load_dir = "./save_data"
-        os.makedirs(self.save_load_dir, exist_ok=True)
-
+        self.base_filename = f"{source}_dataset.pt"
+        self.save_dir = "./save_data"
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.load_dir = load_dir
         # Check if we need to process
         needs_processing = force_reload
         if not needs_processing:
             # Check if specific stage files exist (graph + label)
             test_suffix = "test" if self.is_test else ""
             g_path = os.path.join(
-                self.save_load_dir,
-                base_filename.replace(
+                self.load_dir,
+                self.base_filename.replace(
                     ".pt", f"_stage{stage}{test_suffix}_graph.pt"),
             )
             l_path = os.path.join(
-                self.save_load_dir,
-                base_filename.replace(
+                self.load_dir,
+                self.base_filename.replace(
                     ".pt", f"_stage{stage}{test_suffix}_label.pt"),
             )
             if not (os.path.exists(g_path) and os.path.exists(l_path)):
@@ -262,20 +399,11 @@ class CustomDataset(Dataset):
         if source == "DAppSCAN":
             self._fetch_and_process_DAppSCAN_data(
                 force_reload=needs_processing)
-            self.postprocessing()
+        elif source == "MANDO":
+            self._fetch_and_process_MANDO_data(
+                force_reload=needs_processing)
+        self.postprocessing()
 
-    def _stage_file_paths(self, stage: int):
-        """Returns (graph_path, label_path, embedding_path)."""
-        base_filename = "DAppSCAN_dataset.pt"
-        base_path = os.path.join(self.save_load_dir, base_filename)
-        test_suffix = "test" if self.is_test else ""
-        g_path = base_path.replace(
-            ".pt", f"_stage{stage}{test_suffix}_graph.pt")
-        l_path = base_path.replace(
-            ".pt", f"_stage{stage}{test_suffix}_label.pt")
-
-    
-        return g_path, l_path
 
     def set_active_stage(self, stage):
         self.stage = stage
@@ -291,13 +419,13 @@ class CustomDataset(Dataset):
 
     def _fetch_and_process_DAppSCAN_data(self, force_reload=False):
         """Orchestrates loading from disk or fetching & processing data."""
-        base_filename = "DAppSCAN_dataset.pt"
-        saved_file_path = os.path.join(self.save_load_dir, base_filename)
-
+        base_filename = self.base_filename
+        saved_file_path = os.path.join(self.load_dir, base_filename)
+        load_file_path = os.path.join(self.load_dir, base_filename) 
         try:
             # 1. Try Loading Existing Data (If not forced)
             if not force_reload:
-                if self._load_data(saved_file_path):
+                if self._load_data(load_file_path):
                     return
 
             # 2. Process New Data (Generates ALL stages)
@@ -333,6 +461,50 @@ class CustomDataset(Dataset):
             logger.error(f"Error in data processing: {e}")
             traceback.print_exc()
 
+    def _fetch_and_process_MANDO_data(self, force_reload=False):
+        """Orchestrates loading from disk or fetching & processing data."""
+        base_filename = self.base_filename
+        saved_file_path = os.path.join(self.save_dir, base_filename)
+        load_file_path = os.path.join(self.load_dir, base_filename) 
+        try:
+            # 1. Try Loading Existing Data (If not forced)
+            if not force_reload:
+                if self._load_data(load_file_path):
+                    return
+
+            # 2. Process New Data (Generates ALL stages)
+            logger.info("Fetching and processing MANDO data...")
+            res = f6_fetch_MANDO_data(
+                root=Path("/mnt/d/KLTN2/DatasetEtherScanio/ge-sc-data/ProcessedData/success/").as_posix() , is_test=self.is_test
+            )
+
+            if not res or not res[0] or not res[1]:
+                logger.error("Failed to fetch MANDO data.")
+                sys.exit(1)
+
+            cpg_list, vuln_json_list = res
+
+            # Run 3-Stage Processing
+            # This returns a dict with 'stage1', 'stage2', 'stage3' keys
+            logger.info("Running CPG Processor (generating all 3 stages)...")
+            self.cascade_results = self.CPG_Proccessor.process_graphs(
+                cpg_list, vuln_json_list
+            )
+
+            # 3. Save All Stages
+            self._save_data(saved_file_path)
+
+            # 4. Populate in-memory for the active stage (so postprocessing works)
+            stage_key = f"stage{self.stage}"
+            stage_data = self.cascade_results.get(stage_key, {})
+            # Store as dicts keyed by project name to avoid relying on list ordering.
+            self.dataset_graph[self.stage] = dict(stage_data.get("graphs", []))
+            self.dataset_label[self.stage] = dict(stage_data.get("labels", []))
+
+        except Exception as e:
+            logger.error(f"Error in data processing: {e}")
+            traceback.print_exc()
+
 
     def _save_data(self, base_path):
         """Saves distinct files for each stage."""
@@ -341,6 +513,7 @@ class CustomDataset(Dataset):
             logger.info("Saving 3-stage cascade data to disk...")
             for s in [1, 2, 3]:
                 key = f"stage{s}"
+                print(f"  Saving Stage {s} data...")
                 data = self.cascade_results.get(key, {})
 
                 # Paths
@@ -360,7 +533,7 @@ class CustomDataset(Dataset):
                     # flattened_labels: List[(project_name, subkey, label)]
                     for p_name, graph_dict in data.get("graphs", []):
                         if not isinstance(graph_dict, dict):
-                            logger.warning(
+                            print(
                                 f"Stage {s} graphs for {p_name} is not a dict; skipping"
                             )
                             continue
@@ -368,9 +541,10 @@ class CustomDataset(Dataset):
                             flattened_graphs.append((p_name, subkey, g))
                     for p_name, label_dict in data.get("labels", []):
                         if not isinstance(label_dict, dict):
-                            logger.warning(
+                            print(
                                 f"Stage {s} labels for {p_name} is not a dict; skipping"
                             )
+                            
                             continue
                         for subkey, lbl in label_dict.items():
                             flattened_labels.append((p_name, subkey, lbl))
@@ -389,15 +563,22 @@ class CustomDataset(Dataset):
         """Loads the current stage file."""
         s = self.stage
         print(f"Attempting to load Stage {s} data from disk...")
-        g_path, l_path = self._stage_file_paths(s)
+        # Paths
+        test_suffix = "test" if self.is_test else ""
+        g_path = base_path.replace(
+            ".pt", f"_stage{s}{test_suffix}_graph.pt"
+        )
+        l_path = base_path.replace(
+            ".pt", f"_stage{s}{test_suffix}_label.pt"
+        )
 
         if os.path.exists(g_path) and os.path.exists(l_path):
             logger.info(f"Loading Stage {s} from disk...")
             flattened_graphs = torch.load(
-                g_path, map_location="cpu", weights_only=False
+                g_path, map_location="cpu", weights_only=False, mmap=True
             )
             flattened_labels = torch.load(
-                l_path, map_location="cpu", weights_only=False
+                l_path, map_location="cpu", weights_only=False, mmap=True
             )
 
             # Deflatten: Group by project
@@ -549,7 +730,7 @@ class CustomDataset(Dataset):
 
                         # Standardize heterograph schema so batching never drops data.
                         try:
-                            g = standardize_stage3_heterograph(
+                            g = standardize_heterograph(
                                 g,
                                 getattr(self.CPG_Proccessor,
                                         "rel_names", None),
@@ -585,7 +766,7 @@ class CustomDataset(Dataset):
 
 
                     if self.stage in [1, 2]:
-                        g = standardize_stage3_heterograph(
+                        g = standardize_heterograph(
                             g,
                             getattr(self.CPG_Proccessor, "rel_names", None),
                             self.embedding_dims,
@@ -730,6 +911,13 @@ if __name__ == "__main__":
         help="If set, fully re-processes raw data and regenerates graphs for all 3 stages.",
     )
     parser.add_argument(
+        "--source",
+        type=str,
+        default="DAppSCAN",
+        choices=["DAppSCAN", "MANDO"],
+        help="Which source to load",
+    )
+    parser.add_argument(
         "--stage",
         type=int,
         default=3,
@@ -749,207 +937,7 @@ if __name__ == "__main__":
     print(f"  Target Stage: {args.stage}")
     print("=" * 60)
 
-    def _stage_paths(stage: int):
-        base = os.path.join("./save_data", "DAppSCAN_dataset.pt")
-        test_suffix = "test" if args.test else ""
-        g_path = base.replace(".pt", f"_stage{stage}{test_suffix}_graph.pt")
-        l_path = base.replace(".pt", f"_stage{stage}{test_suffix}_label.pt")
-        return g_path, l_path
-
-    def _load_stage_files(stage: int):
-        g_path, l_path = _stage_paths(stage)
-        if not (os.path.exists(g_path) and os.path.exists(l_path)):
-            return None, None
-
-        flattened_graphs = torch.load(
-            g_path, map_location="cpu", weights_only=False)
-        flattened_labels = torch.load(
-            l_path, map_location="cpu", weights_only=False)
-
-        graphs_by_project = {}
-        for item in flattened_graphs:
-            if isinstance(item, (list, tuple)) and len(item) == 3:
-                p_name, subkey, g = item
-            else:
-                raise ValueError(
-                    f"Unexpected graph item format in {g_path}: {type(item)} len={len(item) if isinstance(item, (list, tuple)) else 'n/a'}"
-                )
-            graphs_by_project.setdefault(p_name, {})[subkey] = g
-
-        labels_by_project = {}
-        for item in flattened_labels:
-            if isinstance(item, (list, tuple)) and len(item) == 3:
-                p_name, subkey, lbl = item
-            else:
-                raise ValueError(
-                    f"Unexpected label item format in {l_path}: {type(item)} len={len(item) if isinstance(item, (list, tuple)) else 'n/a'}"
-                )
-            labels_by_project.setdefault(p_name, {})[subkey] = lbl
-
-        return graphs_by_project, labels_by_project
-
-    def _print_and_assert_raw_schema(stage: int):
-        graphs_by_project, labels_by_project = _load_stage_files(stage)
-        if graphs_by_project is None or labels_by_project is None:
-            print(f"Stage {stage}: no saved files")
-            return
-
-        projects = list(graphs_by_project.keys())
-        print(f"\nFinal Results Schema (from saved stage{stage} files):")
-        print(
-            f"  stage{stage}: graphs={len(projects)}, labels={len(labels_by_project)}")
-        if not projects:
-            return
-
-        p0 = projects[0]
-        gdict = graphs_by_project[p0]
-        ldict = labels_by_project.get(p0, {})
-        print(f"    Sample project: {p0}")
-        print(f"    Sample graphs container type: {type(gdict)}")
-        print(f"    Subgraphs: {len(gdict)}")
-        first_subkey = next(iter(gdict.keys())) if gdict else None
-        print(f"    First subkey: {first_subkey}")
-        if first_subkey is not None:
-            print(f"    First subgraph type: {type(gdict[first_subkey])}")
-
-        print(f"    Sample labels container type: {type(ldict)}")
-        print(f"    Label keys: {len(ldict)}")
-        if first_subkey is None:
-            return
-
-        # Strict key match
-        g_keys = set(gdict.keys())
-        l_keys = set(ldict.keys())
-        if g_keys != l_keys:
-            missing = sorted(list(g_keys - l_keys))[:10]
-            extra = sorted(list(l_keys - g_keys))[:10]
-            raise AssertionError(
-                f"stage{stage} raw schema mismatch for project {p0}: graphs={len(g_keys)} labels={len(l_keys)} missing={missing} extra={extra}"
-            )
-
-        v0 = ldict[first_subkey]
-        print(f"    First label key: {first_subkey}")
-        print(f"    First label type: {type(v0)}")
-        if stage == 3:
-            if not isinstance(v0, dict) or ("cfg_node" not in v0 or "ast_node" not in v0):
-                raise AssertionError(
-                    f"stage3 label for {first_subkey} must be dict with cfg_node/ast_node, got {type(v0)}"
-                )
-
-    def _validate_postprocessed(ds: CustomDataset, stage: int, max_checks: int = 25):
-        n = len(ds)
-        print(f"Stage {stage} postprocessed samples: {n}")
-        if n == 0:
-            raise AssertionError(
-                f"Stage {stage} produced 0 samples after postprocessing")
-
-        checks = min(n, max_checks)
-        for i in range(checks):
-            item = ds[i]
-            if stage in [1, 2]:
-                label_dict = item["graph_labels"]
-                if len(label_dict) != 1:
-                    raise AssertionError(
-                        f"Stage {stage}: expected 1 label per item, got {len(label_dict)}"
-                    )
-                k = next(iter(label_dict.keys()))
-                if k.split("@")[0] != item["project_name"]:
-                    raise AssertionError(
-                        f"Stage {stage}: project mismatch for key {k}"
-                    )
-            else:
-                if dgl is None:
-                    raise RuntimeError(
-                        "DGL is required to validate stage 3 graphs")
-                g = item["graph"]
-                cfg = item["cfg_labels"]
-                ast = item["ast_labels"]
-
-                def _pick_ntype(graph, candidates):
-                    for cand in candidates:
-                        if cand in graph.ntypes:
-                            return cand
-                    return None
-
-                cfg_ntype = _pick_ntype(g, ["cfg_node"])
-                ast_ntype = _pick_ntype(g, ["ast_node"])
-                cfg_nodes = g.num_nodes(
-                    cfg_ntype) if cfg_ntype is not None else 0
-                ast_nodes = g.num_nodes(
-                    ast_ntype) if ast_ntype is not None else 0
-                if cfg.shape[0] != cfg_nodes:
-                    raise AssertionError(
-                        f"Stage 3: cfg_labels rows {cfg.shape[0]} != {cfg_ntype} {cfg_nodes}"
-                    )
-                if ast.shape[0] != ast_nodes:
-                    raise AssertionError(
-                        f"Stage 3: ast_labels rows {ast.shape[0]} != {ast_ntype} {ast_nodes}"
-                    )
-
-        print(f"  Validation OK on {checks} samples")
 
     # One processing pass generates and saves all 3 stages.
-    _ = CustomDataset(
+    _ = CustomDataset( source=args.source,
         stage=3, force_reload=args.force_reload, is_test=args.test)
-
-    # Print and assert raw saved schema for all 3 stages.
-    for s in [1, 2, 3]:
-        _print_and_assert_raw_schema(s)
-
-    # Load each stage, run postprocessing, validate strict alignment.
-    for s in [1, 2, 3]:
-        ds = CustomDataset(stage=s, force_reload=False, is_test=args.test)
-        _validate_postprocessed(ds, s)
-
-        # Print actual sample data (not just schema) for the first few items.
-        print(f"\nStage {s} sample data (first 2 items):")
-        for i in range(min(30, len(ds))):
-            item = ds[i]
-            if s in [1, 2]:
-                g = item["graph"]
-                # Embedding is a real tensor from GraphEmbedder
-                key = next(iter(item["graph_labels"].keys()))
-                lbl = item["graph_labels"][key]
-                print(f"  [{i}] key={key}")
-                
-                for ntype in g.ntypes:
-                    n = g.num_nodes(ntype)
-                    feat = g.nodes[ntype].data.get("feat")
-                    feat_shape = tuple(feat.shape) if isinstance(
-                        feat, torch.Tensor) else None
-                    feat_preview = (
-                        feat[0, :8].detach().cpu().tolist()
-                        if isinstance(feat, torch.Tensor) and feat.numel() > 0
-                        else None
-                    )
-                    print(
-                        f"      {ntype}: nodes={n} feat_shape={feat_shape} feat0[:8]={feat_preview}")
-            else:
-                g = item["graph"]
-                cfg = item["cfg_labels"]
-                ast = item["ast_labels"]
-                print(
-                    f"  [{i}] project={item['project_name']} ntypes={list(g.ntypes)}")
-                for ntype in g.ntypes:
-                    n = g.num_nodes(ntype)
-                    feat = g.nodes[ntype].data.get("feat")
-                    feat_shape = tuple(feat.shape) if isinstance(
-                        feat, torch.Tensor) else None
-                    feat_preview = (
-                        feat[0, :8].detach().cpu().tolist()
-                        if isinstance(feat, torch.Tensor) and feat.numel() > 0
-                        else None
-                    )
-                    print(
-                        f"      {ntype}: nodes={n} feat_shape={feat_shape} feat0[:8]={feat_preview}")
-
-                cfg_preview = cfg[:2].detach().cpu().tolist(
-                ) if isinstance(cfg, torch.Tensor) else None
-                ast_preview = ast[:2].detach().cpu().tolist(
-                ) if isinstance(ast, torch.Tensor) else None
-                print(
-                    f"      cfg_labels: shape={tuple(cfg.shape)} first2={cfg_preview}")
-                print(
-                    f"      ast_labels: shape={tuple(ast.shape)} first2={ast_preview}")
-
-    print("\n✅ All 3 stages are schema-consistent and postprocessing-aligned.")

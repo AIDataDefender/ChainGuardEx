@@ -28,209 +28,155 @@ try:
     sys.path.append(parent_dir)
     from experiments.dataset import CustomDataset, custom_collate
     from experiments.the_utils.logger import setup_logger
+    from experiments.the_utils.graph_utils import OWASP_VULN
+    from experiments.the_utils.FocalLoss_and_PCGrad import FocalLoss, PCGrad
 except ImportError:
     from dataset import CustomDataset, custom_collate
     from the_utils.logger import setup_logger
+    from the_utils.graph_utils import OWASP_VULN
+    from the_utils.FocalLoss_and_PCGrad import FocalLoss, PCGrad
 
 os.environ["DGLBACKEND"] = "pytorch"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-class PCGrad:
-    """
-    Gradient Surgery for Multi-Task Learning: Projects conflicting gradients
-    onto each other's normal plane.
-    """
+class Config:
+    class Stage1:
+        batch_size = 128
+        num_epochs = 120
+        learning_rate = 5e-4
+        patience = 14
+        hidden_dim = 128
+        fixed_thresholds = None # self tune
 
-    def __init__(self, optimizer):
-        self._optim = optimizer
-        self.optimizer = optimizer  # compatibility
+        oversample_ratio = 4.0
+        out_dim = 1
+        weight_decay = 0.001
 
-    @property
-    def param_groups(self):
-        return self._optim.param_groups
+        scheduler_factor = 0.5
+        scheduler_patience = 2
+        scheduler_min_lr = 1e-7
 
-    def zero_grad(self):
-        return self._optim.zero_grad()
-
-    def step(self):
-        return self._optim.step()
-
-    def _project_conflicting(self, grads, has_grads, shapes=None):
-        pc_grad, num_task = copy.deepcopy(grads), len(grads)
-        for g_i in pc_grad:
-            random.shuffle(grads)
-            for g_j in grads:
-                g_i_g_j = torch.dot(g_i, g_j)
-                if g_i_g_j < 0:
-                    g_i -= (g_i_g_j) * g_j / (g_j.norm() ** 2)
-        merged_grad = torch.zeros_like(grads[0])
-        for g_i in pc_grad:
-            merged_grad += g_i
-        return merged_grad
-
-    def _set_grad(self, grads):
-        """
-        Set gradients from the list of unflattened gradient tensors.
-        grads: list of gradient tensors with proper shapes for ALL parameters
-        """
-        idx = 0
-        for group in self._optim.param_groups:
-            for p in group["params"]:
-                # Assign gradient (could be zero or actual gradient)
-                # Ensure gradient shape matches parameter shape
-                if grads[idx].shape != p.shape:
-                    raise ValueError(
-                        f"Gradient shape mismatch for param {idx}: expected {p.shape}, got {grads[idx].shape}"
-                    )
-                p.grad = grads[idx]
-                idx += 1
-
-    def _pack_grad(self, objectives):
-        grads, shapes, has_grads = [], [], []
-        for obj in objectives:
-            self._optim.zero_grad(set_to_none=True)
-            obj.backward(retain_graph=True)
-            grad, shape, has_grad = [], [], []
-            for group in self._optim.param_groups:
-                for p in group["params"]:
-                    if p.grad is None:
-                        shape.append(p.shape)
-                        grad.append(torch.zeros_like(p).view(-1))
-                        has_grad.append(
-                            torch.zeros(p.numel(), device=p.device,
-                                        dtype=torch.bool)
-                        )
-                        continue
-                    shape.append(p.grad.shape)
-                    grad.append(p.grad.clone().view(-1))
-                    has_grad.append(
-                        torch.ones(p.numel(), device=p.device,
-                                   dtype=torch.bool)
-                    )
-            grads.append(torch.cat(grad))
-            shapes.append(shape)
-            has_grads.append(torch.cat(has_grad))
-        return grads, shapes, has_grads
-
-    def _unflatten_grad(self, grads, shapes):
-        unflatten_grad, idx = [], 0
-        for shape in shapes:
-            length = np.prod(shape)
-            unflatten_grad.append(grads[idx: idx + length].view(shape))
-            idx += length
-        return unflatten_grad
-
-    def pc_backward(self, objectives):
-        """
-        Calculate gradients for each objective and project conflicting ones.
-        """
-        grads, shapes, has_grads = self._pack_grad(objectives)
-        pc_grad = self._project_conflicting(grads, has_grads)
-        pc_grad = self._unflatten_grad(pc_grad, shapes[0])
-        self._set_grad(pc_grad)
+        focal_alpha = 0.65
+        focal_gamma = 1.55
 
 
-class FocalLoss(nn.Module):
-    """
-    Implements the Focal Loss for Multilabel Classification.
+        grad_clip_max_norm = 1.0
+        eval_threshold_min = 0.05
+        eval_threshold_max = 0.95
+        eval_threshold_steps = 91
 
-    This loss is designed for extreme class imbalance in multilabel settings.
-    For each class independently:
-        FL = -alpha * (1-p)^gamma * log(p)           if y=1
-        FL = -(1-alpha) * p^gamma * log(1-p)         if y=0
+        class_weight_min = 1.0
+        class_weight_max = 10.0
 
-    This down-weights easy examples (high confidence correct predictions)
-    and focuses training on hard, misclassified examples.
-    """
+    class Stage2:
+        batch_size = 128
+        num_epochs = 100
+        learning_rate = 5e-4
+        patience = 14
+        hidden_dim = 128
+        fixed_thresholds = None
 
-    def __init__(self, alpha=0.25, gamma=2.0, pos_weight=None, reduction="none"):
-        """
-        Args:
-            alpha (float): Weight for positive class (0-1).
-                            Typical: 0.25 for positive, 0.75 for negative.
-                            Use higher alpha (0.5-0.75) for rare positives.
-            gamma (float): Focusing parameter (0-5). Higher = more focus on hard examples.
-                            Typical: 2.0. Use 3-5 for extreme imbalance.
-            pos_weight (torch.Tensor): Per-class weights for positive examples [C].
-            reduction (str): 'none', 'mean', or 'sum'.
-        """
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.reduction = reduction
+        oversample_ratio = 4.0
+        out_dim = 1
+        weight_decay = 0.001
 
-    def forward(self, inputs, targets):
-        """
-        Args:
-            inputs (torch.Tensor): Raw logits [B, L, C] or [N, C]
-            targets (torch.Tensor): Binary labels [B, L, C] or [N, C]
+        scheduler_factor = 0.5
+        scheduler_patience = 2
+        scheduler_min_lr = 1e-7
 
-        Returns:
-            torch.Tensor: Focal Loss (unreduced if reduction='none')
-        """
-        # Ensure targets are float
-        targets = targets.float()
+        focal_alpha = 0.65
+        focal_gamma = 1.55
 
-        # Get probabilities (0-1 range)
-        p = torch.sigmoid(inputs)
 
-        # Compute focal loss components separately for positive/negative cases
-        # For y=1: FL = -alpha * (1-p)^gamma * log(p)
-        # For y=0: FL = -(1-alpha) * p^gamma * log(1-p)
+        grad_clip_max_norm = 1.0
+        eval_threshold_min = 0.05
+        eval_threshold_max = 0.95
+        eval_threshold_steps = 91
 
-        # Clamp probabilities to avoid log(0) - use larger epsilon for stability
-        eps = 1e-7
-        p_clamped = torch.clamp(p, min=eps, max=1.0 - eps)
+        class_weight_min = 1.0
+        class_weight_max = 10.0
 
-        # Positive case (y=1)
-        pos_loss = (
-            -self.alpha * torch.pow(1 - p_clamped,
-                                    self.gamma) * torch.log(p_clamped)
-        )
+    class Stage3:
+        batch_size = 256
+        num_epochs = 120
+        learning_rate = 3e-4
+        patience = 14
+        hidden_dim = 128
+        fixed_thresholds = None
 
-        # Negative case (y=0)
-        neg_loss = (
-            -(1 - self.alpha)
-            * torch.pow(p_clamped, self.gamma)
-            * torch.log(1 - p_clamped)
-        )
+        oversample_ratio = 10.0
+        out_dim = 8
+        weight_decay = 0.001
 
-        # Combine based on target
-        focal_loss = targets * pos_loss + (1 - targets) * neg_loss
+        scheduler_factor = 0.5
+        scheduler_patience = 2
+        scheduler_min_lr = 1e-8
 
-        # Apply per-class weights if provided
-        if self.pos_weight is not None:
-            # pos_weight shape: [C], focal_loss shape: [..., C]
-            # Apply weight only to positive examples
-            weight_mask = targets * \
-                (self.pos_weight.to(targets.device) - 1) + 1
-            focal_loss = focal_loss * weight_mask
+        focal_alpha = 0.45
+        focal_gamma = 1.65
 
-        # Apply reduction if specified
-        if self.reduction == "mean":
-            return focal_loss.mean()
-        elif self.reduction == "sum":
-            return focal_loss.sum()
-        else:
-            return focal_loss
+        label_smoothing = 0.05
+        grad_clip_max_norm = 1.0
+
+        eval_threshold_min = 0.1
+        eval_threshold_max = 0.9
+        eval_threshold_steps = 17
+
+        eval_score_f1_weight = 0.6
+        eval_score_prec_weight = 0.4
+        eval_min_threshold = 0.2
+
+        class_weight_min = 1.0
+        class_weight_max = 10.0
+
+    class Base:
+        train_ratio = 0.7
+        val_ratio = 0.2 # test_ratio = 0.1
+        rand_seed = 42
+
 
 
 class BaseTrainer:
     def __init__(
         self,
-        stage=3,  # NEW: Pass stage to trainer
-        batch_size=4,
-        num_epochs=30,
-        learning_rate=None,  # Auto-set based on stage
-        patience=10,
-        hidden_dim=256,
-        rand_seed=42,
+        stage=3,
+        batch_size=None,
+        num_epochs=None,
+        learning_rate=None,
+        patience=None,
+        hidden_dim=None,
+        rand_seed=None,
         log_folder=None,
+        oversample_ratio=None,
+        model_type=None,
     ):
-        self.stage = int(stage)
-        self.set_rand_seed(rand_seed)
+        self.stage = int(stage) 
+        if self.stage not in [1, 2, 3]:
+            raise ValueError("Stage must be 1, 2, or 3.")
+        self.set_rand_seed(rand_seed or Config.Base.rand_seed)
+
+        # Get stage-specific config
+        if self.stage == 1:
+            config = Config.Stage1
+        elif self.stage == 2:
+            config = Config.Stage2
+        else:
+            config = Config.Stage3
+
+        # Use provided values or defaults from config
+        self.batch_size = batch_size or config.batch_size
+        self.num_epochs = num_epochs or config.num_epochs
+        self.learning_rate = learning_rate or config.learning_rate
+        self.patience = patience or config.patience
+        self.hidden_dim = hidden_dim or config.hidden_dim
+        self.oversample_ratio = oversample_ratio or config.oversample_ratio
+        self.fixed_thresholds = config.fixed_thresholds  # 0.65
+        # Model selection (baseline_X variants). None preserves baseline_X default.
+        self.model_type = model_type
+        # Store config for later use
+        self.config = config
+        
 
         # Logging
         self.log_folder = log_folder or Path(
@@ -252,26 +198,15 @@ class BaseTrainer:
             print(f"  PyTorch version: {torch.__version__}")
             print(f"  CUDA built version: {torch.version.cuda}")
             self.device = torch.device("cpu")
-        
-        self.batch_size = batch_size
-        self.num_epochs = num_epochs
-        # Stage-specific learning rates: Stage 1/2 need higher LR due to extreme imbalance
-        if learning_rate is None:
-            self.learning_rate = 1e-4 if self.stage in [1, 2] else 3e-5
-        else:
-            self.learning_rate = learning_rate
-        self.patience = patience
-        self.hidden_dim = hidden_dim
-
-        # History tracking
-        self.history = {"train_loss": [],
-                        "val_loss": [], "val_f1": [], "val_auc": []}
 
         # Mode Switching
         self.is_graph_level = (self.stage in [1, 2])
         self.logger.info(
             f"Initialized Trainer for Stage {self.stage} ({'Graph' if self.is_graph_level else 'Node'} Classification)")
         self.logger.info(f"Using device: {self.device}")
+
+        # History tracking
+        self.history = {"train_loss": [], "val_loss": [], "val_f1": [], "val_auc": []}
 
         self.embedding_dims = None
         # Initialize Dataset
@@ -290,9 +225,17 @@ class BaseTrainer:
     def load_data(self, rand_seed):
         self.logger.info("Loading dataset...")
         # Pass stage to CustomDataset
-        self.dataset = CustomDataset(
-            source="DAppSCAN", force_reload=False, rand_seed=rand_seed, stage=self.stage)
-        self.embedding_dims = self.dataset.embedding_dims
+        dataset1 = CustomDataset(
+            source="DAppSCAN", load_dir="./save_data2", force_reload=False, rand_seed=rand_seed, stage=self.stage)
+        self.embedding_dims = dataset1.embedding_dims
+        dataset2 = CustomDataset(
+            source="MANDO", load_dir="./save_data3", force_reload=False, rand_seed=rand_seed, stage=self.stage)
+
+        from torch.utils.data import ConcatDataset  # Add this import at the top
+
+        # Fuse into one dataset
+        self.dataset = ConcatDataset([dataset1, dataset2])
+        self.dataset1 = dataset1  # Keep reference for attributes
 
         # Stratified Split (80/10/10) to keep label ratios consistent across splits.
         # For Stage 1/2: binary graph labels.
@@ -317,24 +260,15 @@ class BaseTrainer:
 
         labels = []
         if self.stage in [1, 2]:
-            for _, lbl in getattr(self.dataset, "dataset_label", []):
-                labels.append(_to_binary(lbl))
+            # Extract labels from both datasets
+            for ds in [dataset1, dataset2]:
+                for _, lbl in getattr(ds, "dataset_label", []):
+                    labels.append(_to_binary(lbl))
         else:
-            for _, lbl in getattr(self.dataset, "dataset_label", []):
-                is_pos = 0
-                if isinstance(lbl, dict):
-                    cfg = lbl.get("cfg_node")
-                    ast = lbl.get("ast_node")
-                    try:
-                        if isinstance(cfg, torch.Tensor) and cfg.numel() > 0:
-                            is_pos = 1 if (cfg.sum() > 0).item() else 0
-                        if not is_pos and isinstance(ast, torch.Tensor) and ast.numel() > 0:
-                            is_pos = 1 if (ast.sum() > 0).item() else 0
-                    except Exception:
-                        is_pos = 0
-                labels.append(int(is_pos))
+            # For Stage 3, use random split since it's node-level multilabel
+            labels = None
 
-        if len(labels) != n_total:
+        if labels is not None and len(labels) != n_total:
             self.logger.warning(
                 f"Label extraction mismatch: got {len(labels)} labels for dataset size {n_total}. Falling back to random split."
             )
@@ -350,7 +284,7 @@ class BaseTrainer:
             # Log overall balance (useful for Stage 1/2 where positives may be extremely rare).
             try:
                 self.logger.info(
-                    f"[SPLIT DEBUG] Total={len(y)} | pos={len(idx1)} ({(len(idx1)/len(y)*100):.3f}%) | neg={len(idx0)}"
+                    f"[GREEN][SPLIT DEBUG] Total={len(y)} | pos={len(idx1)} ({(len(idx1)/len(y)*100):.3f}%) | neg={len(idx0)}"
                 )
             except Exception:
                 pass
@@ -416,15 +350,16 @@ class BaseTrainer:
             all_idx = list(range(n_total))
             rng = random.Random(rand_seed)
             rng.shuffle(all_idx)
-            train_size = int(0.8 * n_total)
-            val_size = int(0.1 * n_total)
+            train_size = int(Config.Base.train_ratio * n_total)
+            val_size = int(Config.Base.val_ratio * n_total)
             train_idx = all_idx[:train_size]
             val_idx = all_idx[train_size: train_size + val_size]
             test_idx = all_idx[train_size + val_size:]
+
         else:
             train_idx, val_idx, test_idx = _stratified_indices(
                 labels, rand_seed)
-
+            
         # Persist class balance for Stage 1/2 loss weighting.
         self._split_stats = {
             "train": {"pos": 0, "neg": 0},
@@ -445,19 +380,72 @@ class BaseTrainer:
             self._split_stats["test"] = {"pos": te_pos, "neg": te_neg}
             try:
                 self.logger.info(
-                    f"[SPLIT DEBUG] Train={len(train_idx)} (pos={tr_pos}, neg={tr_neg}) | "
+                    f"[GREEN][SPLIT DEBUG] Train={len(train_idx)} (pos={tr_pos}, neg={tr_neg}) | "
                     f"Val={len(val_idx)} (pos={va_pos}, neg={va_neg}) | "
                     f"Test={len(test_idx)} (pos={te_pos}, neg={te_neg})"
                 )
             except Exception:
                 pass
 
+        if self.stage in [1, 2] and self.oversample_ratio > 1.0 and labels is not None:
+            positive_indices = [idx for idx in train_idx if labels[idx] == 1]
+            if positive_indices:
+                original_len = len(train_idx)
+                num_duplicates = int(self.oversample_ratio - 1)
+                for _ in range(num_duplicates):
+                    train_idx.extend(positive_indices)
+                self.logger.info(
+                    f"[DATA DEBUG] Oversampled {len(positive_indices)} positive graphs {num_duplicates} times, train set from {original_len} to {len(train_idx)}")
+
+        if self.stage == 3 and self.oversample_ratio > 1.0:
+            # Compute class counts for training set
+            class_pos_counts = torch.zeros(8, dtype=torch.float32)
+            for idx in train_idx:
+                sample = self.dataset[idx]
+                if 'cfg_labels' in sample and sample['cfg_labels'] is not None:
+                    class_pos_counts += sample['cfg_labels'].sum(dim=0).cpu()
+                if 'ast_labels' in sample and sample['ast_labels'] is not None:
+                    class_pos_counts += sample['ast_labels'].sum(dim=0).cpu()
+
+            # Define rare classes as those with count < mean count (excluding benign)
+            mean_count = class_pos_counts.mean()
+            rare_classes = [i for i in range(
+                8) if class_pos_counts[i] < mean_count]
+            self.logger.info(
+                f"[DATA DEBUG] Rare classes (count < {mean_count:.0f}): {rare_classes} with counts {class_pos_counts[rare_classes].numpy()}")
+
+            # Identify graphs with rare labels
+            positive_indices = []
+            for idx in train_idx:
+                sample = self.dataset[idx]
+                has_rare = False
+                for labels in [sample.get('cfg_labels'), sample.get('ast_labels')]:
+                    if labels is not None:
+                        for class_idx in rare_classes:
+                            if labels[:, class_idx].sum() > 0:
+                                has_rare = True
+                                break
+                        if has_rare:
+                            break
+                if has_rare:
+                    positive_indices.append(idx)
+
+            if positive_indices:
+                original_len = len(train_idx)
+                num_duplicates = int(self.oversample_ratio - 1)
+                for _ in range(num_duplicates):
+                    train_idx.extend(positive_indices)
+                self.logger.info(
+                    f"[DATA DEBUG] Oversampled {len(positive_indices)} graphs with rare labels {num_duplicates} times, train set from {original_len} to {len(train_idx)}")
+            else:
+                self.logger.warning(
+                    "[DATA DEBUG] No graphs with rare labels found for oversampling")
+
         train_ds = Subset(self.dataset, train_idx)
         val_ds = Subset(self.dataset, val_idx)
         test_ds = Subset(self.dataset, test_idx)
 
         # Create Loaders
-        # IMPORTANT: custom_collate needs to know the stage!
         def collate_fn(b): return custom_collate(b, stage=self.stage)
 
         self.train_loader = GraphDataLoader(
@@ -479,14 +467,20 @@ class BaseTrainer:
                 "No valid sample found in dataset for model setup.")
 
         # Get rel_names from processor
-        self.rel_names = self.dataset.CPG_Proccessor.rel_names
-
+        self.rel_names = self.dataset1.CPG_Proccessor.rel_names
+        print(self.rel_names)
+        # [('cfg_node', 'cf_false', 'cfg_node'),
+        # ('cfg_node', 'return_call', 'cfg_node'),
+        # ('cfg_node', 'df', 'cfg_node'),
+        # ('ast_node', 'ast_to_cfg', 'cfg_node'),
+        # ('cfg_node', 'cf', 'cfg_node'),
+        # ('ast_node', 'ast_child', 'ast_node'),
+        # ('cfg_node', 'call', 'cfg_node')]
         # Use embedding_dims from CPG_Processor
         node_dims = {
             'cfg_node': self.embedding_dims['cfg_node'],
             'ast_node': self.embedding_dims['ast_node'],
         }
-
         edge_dims = {}
         rel_names = []
         if self.stage == 3:
@@ -498,128 +492,148 @@ class BaseTrainer:
             edge_dims = {et: self.embedding_dims['edge'] for et in rel_names}
 
         # 2. Define Output Dim
-        # Stage 3: 8 Classes (Multi-label)
-        # Stage 1/2: 1 Class (Binary)
-        out_dim = 8 if self.stage == 3 else 1
+        out_dim = self.config.out_dim
 
         # 3. Instantiate Model
-        try:
-            from experiments.models.baseline_6 import CascadedHeteroModel
-            from experiments.models.baseline_simple import SimpleHeteroModel
-        except Exception:
-            from models.baseline_6 import CascadedHeteroModel
-            from models.baseline_simple import SimpleHeteroModel
-            
-        self.model = CascadedHeteroModel(
-            node_dims=node_dims,
-            edge_dims=edge_dims,
-            hidden_dim=self.hidden_dim,
-            out_dim=out_dim,
-            rel_names=rel_names,
-            stage=self.stage
-        ).to(self.device)
+        self.model = None
+        if self.model_type:
+            try:
+                from experiments.models.baseline_X import CascadedHeteroModel
+            except Exception:
+                from models.baseline_X import CascadedHeteroModel
+
+            self.model = CascadedHeteroModel(
+                node_dims=node_dims,
+                edge_dims=edge_dims,
+                hidden_dim=self.hidden_dim,
+                out_dim=out_dim,
+                rel_names=rel_names,
+                stage=self.stage,
+                model_type=self.model_type,
+            ).to(self.device)
+        else:
+            try:
+                from experiments.models.proto_2 import CascadedHeteroModel
+            except Exception:
+                from models.proto_2 import CascadedHeteroModel
+
+            self.model = CascadedHeteroModel(
+                node_dims=node_dims,
+                edge_dims=edge_dims,
+                hidden_dim=self.hidden_dim,
+                out_dim=out_dim,
+                rel_names=rel_names,
+                stage=self.stage,
+            ).to(self.device)
 
         # 4. Optimizer & Loss & Scheduler
         base_optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
+            self.model.parameters(), lr=self.learning_rate, weight_decay=self.config.weight_decay)
         self.optimizer = PCGrad(base_optimizer)
-        
-        # Add warmup + cosine scheduler for Stage 1/2
+
         if self.stage in [1, 2]:
-            total_steps = len(self.train_loader) * self.num_epochs
-            warmup_steps = int(0.1 * total_steps)  # 10% warmup
-            self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.scheduler = None
+            self.reduce_on_plateau = optim.lr_scheduler.ReduceLROnPlateau(
                 base_optimizer,
-                max_lr=self.learning_rate * 3,  # Peak at 3x base LR
-                total_steps=total_steps,
-                pct_start=0.1,  # 10% warmup
-                anneal_strategy='cos'
+                mode='min',
+                factor=self.config.scheduler_factor,
+                patience=self.config.scheduler_patience,
+                min_lr=self.config.scheduler_min_lr
             )
-            self.logger.info(f"[SCHEDULER] OneCycleLR: max_lr={self.learning_rate * 3:.2e}, warmup={warmup_steps} steps")
-            self.reduce_on_plateau = None
+            self.logger.info(
+                f"[SCHEDULER] ReduceLROnPlateau: factor={self.config.scheduler_factor}, patience={self.config.scheduler_patience}, min_lr={self.config.scheduler_min_lr}")
         else:
             # For Stage 3, use ReduceLROnPlateau to handle overfitting
             self.scheduler = None
             self.reduce_on_plateau = optim.lr_scheduler.ReduceLROnPlateau(
                 base_optimizer,
                 mode='min',
-                factor=0.5,
-                patience=3,
-                verbose=True,
-                min_lr=1e-8
+                factor=self.config.scheduler_factor,
+                patience=self.config.scheduler_patience,
+                min_lr=self.config.scheduler_min_lr
             )
-            self.logger.info(f"[SCHEDULER] ReduceLROnPlateau: factor=0.5, patience=3")
+            self.logger.info(
+                f"[SCHEDULER] ReduceLROnPlateau: factor={self.config.scheduler_factor}, patience={self.config.scheduler_patience}")
 
-        # Stage-specific loss:
-        # - Stage 1/2: FocalLoss for extreme imbalance (better than BCE for rare positives)
-        # - Stage 3: FocalLoss (multilabel) with per-class weights
         if self.stage in [1, 2]:
             pos = int(getattr(self, "_split_stats", {}).get(
                 "train", {}).get("pos", 0))
             neg = int(getattr(self, "_split_stats", {}).get(
                 "train", {}).get("neg", 0))
-            
-            # Use FocalLoss with high alpha for rare positives
+
             if pos > 0 and neg > 0:
-                pos_weight = torch.tensor(
-                    [neg / max(1, pos)], dtype=torch.float32, device=self.device)
+                pos_weight = torch.clamp(
+                    torch.tensor([neg / max(1, pos)], dtype=torch.float32, device=self.device),
+                    min=self.config.class_weight_min, max=self.config.class_weight_max
+                )
                 self.logger.info(
-                    f"[LOSS DEBUG] Stage{self.stage} BCE pos_weight={float(pos_weight.item()):.4f}")
-                self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+                    f"[GREEN][LOSS DEBUG] Stage{self.stage} pos_weight={float(pos_weight.item()):.4f}")
+                self.criterion = FocalLoss(
+                    alpha=self.config.focal_alpha, gamma=self.config.focal_gamma, pos_weight=pos_weight, reduction="none")
+                # nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             else:
                 self.logger.warning(
-                    f"[LOSS DEBUG] Stage{self.stage} has pos={pos}, neg={neg} in train; using unweighted BCEWithLogitsLoss"
+                    f"[RED][LOSS DEBUG] Stage{self.stage} has pos={pos}, neg={neg} in train; using unweighted BCEWithLogitsLoss"
                 )
                 self.criterion = nn.BCEWithLogitsLoss()
         else:
             # Compute per-class weights for Stage 3 multilabel
             pos_weight = self._compute_stage3_class_weights()
-            self.criterion = FocalLoss(alpha=.65, gamma=2.5, pos_weight=pos_weight, reduction="none")
+            self.criterion = FocalLoss(
+                alpha=self.config.focal_alpha, gamma=self.config.focal_gamma, pos_weight=pos_weight, reduction="none")
+
             if pos_weight is not None:
-                self.logger.info(f"[LOSS DEBUG] Per-class weights: {pos_weight.cpu().numpy()}")
-        
+                self.logger.info(
+                    f"[GREEN][LOSS DEBUG] Per-class weights: {pos_weight.cpu().numpy()}")
+
         # Store best thresholds for Stage 3 (initialized to 0.5)
-        self.best_thresholds = torch.full((8,), 0.5, dtype=torch.float32) if self.stage == 3 else None
+        self.best_thresholds = torch.full(
+            (self.config.out_dim,), 0.5, dtype=torch.float32) if self.stage == 3 else None
 
     def _compute_stage3_class_weights(self):
         """Compute per-class weights for Stage 3 multilabel classification."""
         if self.stage != 3:
             return None
-        
+
         self.logger.info("Computing per-class weights for Stage 3...")
-        class_pos_counts = torch.zeros(8, dtype=torch.float32)
-        class_neg_counts = torch.zeros(8, dtype=torch.float32)
-        
+        class_pos_counts = torch.zeros(
+            self.config.out_dim, dtype=torch.float32)
+        class_neg_counts = torch.zeros(
+            self.config.out_dim, dtype=torch.float32)
+
         # Count positive/negative samples per class across training data
         for batch in self.train_loader:
             if batch is None:
                 continue
-            
+
             cfg_labels = batch.get('cfg_labels')
             ast_labels = batch.get('ast_labels')
-            
+
             if cfg_labels is not None:
                 class_pos_counts += cfg_labels.sum(dim=0).cpu()
                 class_neg_counts += (1 - cfg_labels).sum(dim=0).cpu()
-            
+
             if ast_labels is not None:
                 class_pos_counts += ast_labels.sum(dim=0).cpu()
                 class_neg_counts += (1 - ast_labels).sum(dim=0).cpu()
-        
+
         # Compute pos_weight = neg_count / max(pos_count, 1) for each class
         pos_weight = class_neg_counts / torch.clamp(class_pos_counts, min=1.0)
-        
+
         # Cap maximum weight to prevent extreme values
-        pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)
-        
-        self.logger.info(f"Class positive counts: {class_pos_counts.numpy()}")
-        self.logger.info(f"Class negative counts: {class_neg_counts.numpy()}")
-        
+        pos_weight = torch.clamp(
+            pos_weight, min=self.config.class_weight_min, max=self.config.class_weight_max)
+
+        self.logger.info(
+            f"[GREEN]Class positive counts: {class_pos_counts.numpy()}")
+        self.logger.info(
+            f"[GREEN]Class negative counts: {class_neg_counts.numpy()}")
+
         return pos_weight.to(self.device)
-    
+
     def _prepare_batch(self, batch):
         """Moves batch to device and extracts labels based on stage."""
-        if self.is_graph_level:
+        if self.stage in [1, 2]:
             g = batch['graph'].to(self.device)
 
             # Labels are dicts: {"ContractA": 0, "ContractB": 1, ...}
@@ -647,11 +661,13 @@ class BaseTrainer:
 
     def train(self):
         best_f1 = 0.0
+        best_loss = float('inf')
         patience_counter = 0
 
         for epoch in range(self.num_epochs):
             self.model.train()
             epoch_loss = 0
+            grad_norms = []
 
             batch_count = 0
             for batch in tqdm(self.train_loader, desc=f"Ep {epoch+1} Train"):
@@ -673,39 +689,69 @@ class BaseTrainer:
                     continue
                 # Use PCGrad for backward
                 if isinstance(loss, list):
-                    self.optimizer.pc_backward(loss)
-                    epoch_loss += sum(loss_item.item() for loss_item in loss)
+                    if isinstance(self.optimizer, PCGrad):
+                        self.optimizer.pc_backward(loss)
+                        epoch_loss += sum(loss_item.item()
+                                            for loss_item in loss)
+                    else:
+                        total_loss = sum(loss)
+                        total_loss.backward()
+                        epoch_loss += total_loss.item()
+
                 else:
-                    self.optimizer.pc_backward([loss])
-                    epoch_loss += loss.item()
-                
+                    # Stage 1/2: single loss
+                    if isinstance(self.optimizer, PCGrad):
+                        self.optimizer.pc_backward([loss])
+                        epoch_loss += loss.item()
+                    else:
+                        loss.backward()
+                        epoch_loss += loss.item()
+
                 # Gradient clipping for stability
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # CRITICAL: Actually update the weights!
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=self.config.grad_clip_max_norm)
+                grad_norms.append(grad_norm.item())
+
+                # CRITICAL: Actually update the weights
                 self.optimizer.step()
-                
+
                 batch_count += 1
                 # Log first batch to verify training
                 if batch_count == 1:
                     if isinstance(loss, list):
-                        self.logger.info(f"[TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {[l.item() for l in loss]} | Grad Norm: {grad_norm:.4f}")
+                        self.logger.info(
+                            f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {[l.item() for l in loss]} | Grad Norm: {grad_norm:.4f}")
                     else:
-                        self.logger.info(f"[TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
-                
+                        self.logger.info(
+                            f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
+
                 # Step scheduler if using OneCycleLR
-                if self.scheduler is not None:
+                if self.scheduler is not None and hasattr(self.scheduler, 'step') and len(self.scheduler.__class__.__name__) == 'OneCycleLR':
                     self.scheduler.step()
 
-            # Validation
-            val_metrics = self.evaluate(self.val_loader)
-            avg_loss = epoch_loss / max(len(self.train_loader), 1)
-            self.logger.info(
-                f"Epoch {epoch+1}: Loss={avg_loss:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f}")
+            # Step epoch-based schedulers
+            if self.scheduler is not None and self.scheduler.__class__.__name__ == 'CosineAnnealingLR':
+                self.scheduler.step()
 
-            # Step scheduler if using ReduceLROnPlateau (Stage 3)
+            # Validation
+            val_metrics = self.evaluate(self.val_loader, self.fixed_thresholds)
+            avg_loss = epoch_loss / max(len(self.train_loader), 1)
+            avg_grad_norm = sum(grad_norms) / \
+                len(grad_norms) if grad_norms else 0
+            self.logger.info(
+                f"[GREEN]Epoch {epoch+1}: Loss={avg_loss:.4f} | Val Loss={val_metrics['loss']:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f} | Avg Grad Norm={avg_grad_norm:.4f}")
+
+            # Step scheduler if using ReduceLROnPlateau
             if self.reduce_on_plateau is not None:
+                prev_lr = self.optimizer.param_groups[0]['lr']
                 self.reduce_on_plateau.step(val_metrics['loss'])
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if current_lr != prev_lr:
+                    self.logger.info(
+                        f"[PURPLE][TRAIN DEBUG] Learning Rate reduced from {prev_lr:.6f} to {current_lr:.6f}")
+                else:
+                    self.logger.info(
+                        f"[PURPLE][TRAIN DEBUG] Current Learning Rate: {current_lr:.6f}")
 
             # Update history
             self.history["train_loss"].append(
@@ -720,8 +766,17 @@ class BaseTrainer:
                 patience_counter = 0
                 torch.save(self.model.state_dict(),
                            f"{self.log_folder}/best_model.pth")
+                self.logger.info(
+                    f"[PURPLE]New best model saved with Val F1={best_f1:.4f} - Patience reset")
+            elif val_metrics['loss'] < best_loss:
+                best_loss = val_metrics['loss']
+                patience_counter = 0
+                self.logger.info(
+                    f"[PURPLE] Best Val Loss={best_loss:.4f} - Patience reset")
             else:
                 patience_counter += 1
+                self.logger.info(
+                    f"{patience_counter} / {self.patience} patience used")
                 if patience_counter >= self.patience:
                     self.logger.info("Early Stopping")
                     break
@@ -751,16 +806,18 @@ class BaseTrainer:
         """Training step for stage 3: Node-level multilabel classification."""
         targets = label_data
         losses = []
-        
+
         # Apply label smoothing to prevent overconfidence
-        label_smoothing = 0.05
-        
+        label_smoothing = self.config.label_smoothing
+
         if targets['cfg'] is not None:
-            smoothed_cfg = targets['cfg'] * (1 - label_smoothing) + 0.5 * label_smoothing
+            smoothed_cfg = targets['cfg'] * \
+                (1 - label_smoothing) + 0.5 * label_smoothing
             losses.append(self.criterion(
                 preds['cfg_logits'], smoothed_cfg).mean())
         if targets['ast'] is not None:
-            smoothed_ast = targets['ast'] * (1 - label_smoothing) + 0.5 * label_smoothing
+            smoothed_ast = targets['ast'] * \
+                (1 - label_smoothing) + 0.5 * label_smoothing
             # Balance AST and CFG losses equally (not 0.5x)
             losses.append(
                 self.criterion(preds['ast_logits'], smoothed_ast).mean())
@@ -808,7 +865,7 @@ class BaseTrainer:
         pos_count = y_true.sum()
         neg_count = len(y_true) - pos_count
         self.logger.info(
-            f"[EVAL DEBUG] Samples: {len(y_true)} | Positive: {pos_count} ({pos_count/len(y_true)*100:.1f}%) | Negative: {neg_count}")
+            f"[YELLOW][EVAL DEBUG] Samples: {len(y_true)} | Positive: {pos_count} ({pos_count/len(y_true)*100:.1f}%) | Negative: {neg_count}")
 
         # Metrics
         thr = 0.5
@@ -820,7 +877,7 @@ class BaseTrainer:
                 if unique.size >= 2:
                     best_f1 = -1.0
                     best_thr = 0.5
-                    for t in np.linspace(0.05, 0.95, 91):
+                    for t in np.linspace(self.config.eval_threshold_min, self.config.eval_threshold_max, self.config.eval_threshold_steps):
                         yp = (y_prob > t).astype(int)
                         f1_t = f1_score(
                             y_true, yp, average='macro', zero_division=0)
@@ -829,7 +886,7 @@ class BaseTrainer:
                             best_thr = float(t)
                     thr = best_thr
                     self.logger.info(
-                        f"[EVAL DEBUG] Best threshold={thr:.3f} (macro-F1={best_f1:.4f})")
+                        f"[YELLOW][EVAL DEBUG] Best threshold={thr:.3f} (macro-F1={best_f1:.4f})")
             except Exception as e:
                 self.logger.warning(
                     f"[EVAL DEBUG] Threshold tuning failed: {e}")
@@ -840,30 +897,40 @@ class BaseTrainer:
             num_classes = y_prob.shape[1]
             if fixed_thresholds is not None:
                 thresholds_used = np.array(fixed_thresholds, dtype=float)
-                self.logger.info(f"[EVAL DEBUG] Using fixed thresholds: {thresholds_used}")
+                self.logger.info(
+                    f"[EVAL DEBUG] Using fixed thresholds: {thresholds_used}")
             elif optimize_thresholds:
                 thresholds_used = np.zeros(num_classes)
                 for class_idx in range(num_classes):
                     y_true_class = y_true[:, class_idx]
                     y_prob_class = y_prob[:, class_idx]
                     if y_true_class.sum() == 0:
-                        thresholds_used[class_idx] = 0.9  # conservative when no positives
+                        # conservative when no positives
+                        thresholds_used[class_idx] = 0.9
                         continue
                     best_score = -1.0
                     best_thr = 0.5
-                    for t in np.linspace(0.25, 0.8, 12):  # conservative, slightly wider
+                    # Wider range for better tuning
+                    for t in np.linspace(self.config.eval_threshold_min, self.config.eval_threshold_max, self.config.eval_threshold_steps):
                         yp = (y_prob_class >= t).astype(int)
                         if yp.sum() == 0:
                             continue
-                        f1_t = f1_score(y_true_class, yp, average='binary', zero_division=0)
-                        prec_t = precision_score(y_true_class, yp, zero_division=0)
-                        score = 0.3 * f1_t + 0.7 * prec_t  # emphasize precision to curb FPs
+                        f1_t = f1_score(y_true_class, yp,
+                                        average='binary', zero_division=0)
+                        prec_t = precision_score(
+                            y_true_class, yp, zero_division=0)
+                        score = self.config.eval_score_f1_weight * f1_t + \
+                            self.config.eval_score_prec_weight * prec_t  # Favor F1 more
                         if score > best_score:
                             best_score = score
                             best_thr = float(t)
-                    thresholds_used[class_idx] = max(best_thr, 0.4)
-                self.logger.info(f"[EVAL DEBUG] Per-class thresholds (optimized): {thresholds_used}")
-                self.best_thresholds = torch.tensor(thresholds_used, dtype=torch.float32)
+                    # Lower min threshold for more predictions
+                    thresholds_used[class_idx] = max(
+                        best_thr, self.config.eval_min_threshold)
+                self.logger.info(
+                    f"[EVAL DEBUG] Per-class thresholds (optimized): {thresholds_used}")
+                self.best_thresholds = torch.tensor(
+                    thresholds_used, dtype=torch.float32)
             else:
                 thresholds_used = np.full(num_classes, 0.5)
 
@@ -874,29 +941,43 @@ class BaseTrainer:
         pred_pos = y_pred.sum()
         pred_neg = len(y_pred) - pred_pos
         self.logger.info(
-            f"[EVAL DEBUG] Predictions: Positive: {pred_pos} ({pred_pos/len(y_pred)*100:.1f}%) | Negative: {pred_neg}")
+            f"[YELLOW][EVAL DEBUG] Predictions: Positive: {pred_pos} ({pred_pos/len(y_pred)*100:.1f}%) | Negative: {pred_neg}")
         self.logger.info(
             f"[EVAL DEBUG] Prob range: [{y_prob.min():.4f}, {y_prob.max():.4f}] | Mean: {y_prob.mean():.4f}")
 
-        # Macro F1 is safer for imbalance
+        # Use weighted F1 to handle extreme imbalance better (weights by class support)
         f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
-
-        try:
-            auc = roc_auc_score(y_true, y_prob, average='macro')
-        except Exception:
-            auc = 0.5  # Fail gracefully if only one class present
+        # Compute AUC safely for multilabel
+        if self.stage == 3:
+            auc_scores = []
+            for class_idx in range(y_prob.shape[1]):
+                y_true_class = y_true[:, class_idx]
+                y_prob_class = y_prob[:, class_idx]
+                if len(np.unique(y_true_class)) == 2:  # Both classes present
+                    try:
+                        auc_class = roc_auc_score(y_true_class, y_prob_class)
+                        auc_scores.append(auc_class)
+                    except Exception:
+                        pass
+            auc = np.mean(auc_scores) if auc_scores else 0.5
+            self.logger.info(f"[EVAL DEBUG] Per-Class AUC: {auc_scores}")
+        else:
+            try:
+                auc = roc_auc_score(y_true, y_prob, average='macro')
+            except Exception:
+                auc = 0.5  # Fail gracefully if only one class present
 
         # Classification report
         if self.stage == 3:
             # Per-label report for multilabel Stage 3
-            report = classification_report(y_true, y_pred, target_names=[
-                                           f'Vuln{i}' for i in range(8)], zero_division=0)
+            report = classification_report(
+                y_true, y_pred, target_names=OWASP_VULN, zero_division=0, digits=6)
             self.logger.info(
                 f"Per-Label Classification Report (Stage 3):\n{report}")
         else:
             # Binary report for Stages 1/2
             report = classification_report(y_true, y_pred, target_names=[
-                                           'Safe', 'Vuln'], zero_division=0)
+                'Safe', 'Vuln'], zero_division=0, digits=6)
             self.logger.info(f"Classification Report:\n{report}")
 
         return {
@@ -906,6 +987,7 @@ class BaseTrainer:
             'y_pred': y_pred,
             'y_true': y_true,
             'thresholds': thresholds_used,
+            'y_prob': y_prob if self.stage == 3 else None
         }
 
     def _eval_step_graph(self, preds, label_map):
@@ -944,4 +1026,4 @@ class BaseTrainer:
 
     def test(self):
         """Evaluate on test set."""
-        return self.evaluate(self.test_loader)
+        return self.evaluate(self.test_loader, self.fixed_thresholds)

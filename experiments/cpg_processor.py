@@ -447,7 +447,7 @@ class CPG_Processor:
             vuln_label = str(vuln_entry.get("owasp_id", "")).upper().strip()
             if not vuln_label:
                 raise ValueError(f"Missing owasp_id in vuln entry {vuln_key}")
-            if vuln_label not in graph_utils.OWASP_VULN:
+            if vuln_label not in graph_utils.OWASP_VULN and vuln_label not in graph_utils.OWASP_VULN2:
                 raise ValueError(
                     f"Unknown owasp_id '{vuln_label}' in vuln entry {vuln_key}; not in OWASP_VULN"
                 )
@@ -691,8 +691,11 @@ class CPG_Processor:
                             "graph": func_graph, "label": func_label}
         return result
 
-    def _prune_stage3(self, stage2_result, vuln_data):
-        """Keep vulnerable blocks + Dataflow/Control Context for vulnerable functions."""
+    def _prune_stage3(self, stage2_result, vuln_data, max_negative_functions=5):
+        """Keep vulnerable blocks + Dataflow/Control Context for vulnerable functions.
+        
+        Also includes up to max_negative_functions non-vulnerable functions for training balance.
+        """
         # Build Vulnerability Map from vuln_data
         vuln_map = {"ast": {}, "cfg": {}}
         # Iterate through each vulnerability entry
@@ -718,9 +721,11 @@ class CPG_Processor:
                 vuln_map["cfg"][nid].append(vuln_label)
 
         result = {}
+        negative_count = 0
 
+        # First, process all vulnerable functions
         for key, data in stage2_result.items():
-            if data["label"] == 1:  # Only process vulnerable functions
+            if data["label"] == 1:  # Process vulnerable functions
                 func_graph = data["graph"]
                 func_nodes = set(str(n) for n in func_graph.nodes())
                 # Filter vuln_map to only include nodes present in the func_graph
@@ -758,6 +763,29 @@ class CPG_Processor:
                         indexed_labels["ast_node"].append(label)
 
                 result[key] = {"graph": func_graph, "label": indexed_labels}
+
+        # Then, add some non-vulnerable functions for training balance
+        for key, data in stage2_result.items():
+            if data["label"] == 0 and negative_count < max_negative_functions:  # Process non-vulnerable functions
+                func_graph = data["graph"]
+                # For non-vulnerable functions, all node labels are zeros
+                indexed_labels = {"cfg_node": [], "ast_node": []}
+                for nid, node_data in func_graph.nodes(data=True):
+                    n_type = self._normalize_node_type(
+                        node_data.get(GraphAttributes.NODE_TYPE,
+                                      NodeTypes.CFG_NODE)
+                    )
+
+                    # All labels are zeros for non-vulnerable functions
+                    label = [0] * len(graph_utils.OWASP_VULN)
+                    if n_type == self.cfg_node_label:
+                        indexed_labels["cfg_node"].append(label)
+                    elif n_type == self.ast_node_label:
+                        indexed_labels["ast_node"].append(label)
+
+                result[key] = {"graph": func_graph, "label": indexed_labels}
+                negative_count += 1
+
         return result
 
     # =========================================================================
@@ -915,6 +943,7 @@ class CPG_Processor:
                     store["texts"])
 
             # print(g)
+            #g.global_to_local = global_to_local
             return g
         except Exception as e:
             print(f"Error in nx_to_dgl: {e}")
@@ -1069,8 +1098,6 @@ class CPG_Processor:
                         break
 
         print(f"Verified {len(verified_checkpoints)} valid checkpoints.")
-        # temp skip processing
-        projects_to_process = []
         # Process remaining projects first (to avoid OOM)
         for item in tqdm(projects_to_process, desc="Processing graphs"):
             p_name, nx_g = item

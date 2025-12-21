@@ -26,6 +26,6 @@ Siamese-model
 *.pth
 checkpoints*
 debug*
-save_data
+save_data*
 test_output
 .old
