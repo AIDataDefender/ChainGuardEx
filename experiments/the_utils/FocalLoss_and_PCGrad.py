@@ -27,8 +27,13 @@ class PCGrad:
     def param_groups(self):
         return self._optim.param_groups
 
-    def zero_grad(self):
-        return self._optim.zero_grad()
+    def zero_grad(self, set_to_none: bool = False):
+        # Keep signature compatible with torch.optim.Optimizer.zero_grad
+        # so callers can use the faster set_to_none path.
+        try:
+            return self._optim.zero_grad(set_to_none=set_to_none)
+        except TypeError:
+            return self._optim.zero_grad()
 
     def step(self):
         return self._optim.step()

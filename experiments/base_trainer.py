@@ -1,16 +1,18 @@
 from datetime import datetime
+import json
 import logging
 from pathlib import Path
 import sys
 import os
 import random
+import time
 
 import dgl
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
+from contextlib import nullcontext
 
 from tqdm import tqdm
 from dgl.dataloading import GraphDataLoader
@@ -20,6 +22,7 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     classification_report,
+    hamming_loss,
 )
 
 try:
@@ -42,12 +45,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class Config:
     class Stage1:
-        batch_size = 128
+        batch_size = 768
         num_epochs = 120
-        learning_rate = 5e-4
-        patience = 14
+        learning_rate = 1e-2
+        patience = 6
         hidden_dim = 128
-        fixed_thresholds = None # self tune
+        fixed_thresholds = 0.65  # Fixed threshold / use None for dynamic
 
         oversample_ratio = 4.0
         out_dim = 1
@@ -59,7 +62,6 @@ class Config:
 
         focal_alpha = 0.65
         focal_gamma = 1.55
-
 
         grad_clip_max_norm = 1.0
         eval_threshold_min = 0.05
@@ -69,13 +71,14 @@ class Config:
         class_weight_min = 1.0
         class_weight_max = 10.0
 
+
     class Stage2:
-        batch_size = 128
+        batch_size = 768
         num_epochs = 100
-        learning_rate = 5e-4
-        patience = 14
+        learning_rate = 1e-2
+        patience = 6
         hidden_dim = 128
-        fixed_thresholds = None
+        fixed_thresholds = 0.65
 
         oversample_ratio = 4.0
         out_dim = 1
@@ -87,7 +90,6 @@ class Config:
 
         focal_alpha = 0.65
         focal_gamma = 1.55
-
 
         grad_clip_max_norm = 1.0
         eval_threshold_min = 0.05
@@ -98,14 +100,14 @@ class Config:
         class_weight_max = 10.0
 
     class Stage3:
-        batch_size = 256
-        num_epochs = 120
-        learning_rate = 3e-4
-        patience = 14
+        batch_size = 1024
+        num_epochs = 30
+        learning_rate = 5e-3
+        patience = 6
         hidden_dim = 128
-        fixed_thresholds = None
+        fixed_thresholds = 0.65
 
-        oversample_ratio = 10.0
+        oversample_ratio = 4  # 10.0
         out_dim = 8
         weight_decay = 0.001
 
@@ -130,11 +132,14 @@ class Config:
         class_weight_min = 1.0
         class_weight_max = 10.0
 
-    class Base:
-        train_ratio = 0.7
-        val_ratio = 0.2 # test_ratio = 0.1
-        rand_seed = 42
+        
 
+    class Base:
+        train_ratio = 0.6
+        val_ratio = 0.2  # test_ratio = 0.2
+        rand_seed = 42
+        use_torch_compile = True
+        use_profiler = True
 
 
 class BaseTrainer:
@@ -150,11 +155,14 @@ class BaseTrainer:
         log_folder=None,
         oversample_ratio=None,
         model_type=None,
+        use_torch_compile=None,
+        use_profiler=False,
     ):
-        self.stage = int(stage) 
+        self.stage = int(stage)
         if self.stage not in [1, 2, 3]:
             raise ValueError("Stage must be 1, 2, or 3.")
-        self.set_rand_seed(rand_seed or Config.Base.rand_seed)
+        self.rand_seed = rand_seed if rand_seed is not None else Config.Base.rand_seed
+        self.set_rand_seed(self.rand_seed)
 
         # Get stage-specific config
         if self.stage == 1:
@@ -165,18 +173,34 @@ class BaseTrainer:
             config = Config.Stage3
 
         # Use provided values or defaults from config
-        self.batch_size = batch_size or config.batch_size
-        self.num_epochs = num_epochs or config.num_epochs
-        self.learning_rate = learning_rate or config.learning_rate
-        self.patience = patience or config.patience
-        self.hidden_dim = hidden_dim or config.hidden_dim
-        self.oversample_ratio = oversample_ratio or config.oversample_ratio
+        self.batch_size = batch_size if batch_size is not None else config.batch_size
+        self.num_epochs = num_epochs if num_epochs is not None else config.num_epochs
+        self.learning_rate = learning_rate if learning_rate is not None else config.learning_rate
+        self.patience = patience if patience is not None else config.patience
+        self.hidden_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
+        self.oversample_ratio = oversample_ratio if oversample_ratio is not None else config.oversample_ratio
         self.fixed_thresholds = config.fixed_thresholds  # 0.65
         # Model selection (baseline_X variants). None preserves baseline_X default.
         self.model_type = model_type
+        self.use_torch_compile = use_torch_compile if use_torch_compile is not None else Config.Base.use_torch_compile
+
+        self.use_profiler = use_profiler if use_profiler is not None else Config.Base.use_profiler
+
+        print(f"Using Model Type: {self.model_type}")
+        print(f"Oversample Ratio: {self.oversample_ratio}")
+        print(f"Fixed Thresholds: {self.fixed_thresholds}")
+        print(f"Patience: {self.patience}")
+        print(f"Learning Rate: {self.learning_rate}")
+        print(f"Batch Size: {self.batch_size}")
+        print(f"Num Epochs: {self.num_epochs}")
+        print(f"Hidden Dim: {self.hidden_dim}")
+        print(f"Stage: {self.stage}")
+        print(f"Random Seed: {self.rand_seed}")
+        print(f"Use Torch Compile: {self.use_torch_compile}")
+        print(f"Use Profiler: {self.use_profiler}")
+        print("Initializing BaseTrainer...")
         # Store config for later use
         self.config = config
-        
 
         # Logging
         self.log_folder = log_folder or Path(
@@ -193,11 +217,36 @@ class BaseTrainer:
             print(f"✓ CUDA Available: {gpu_count} GPU(s) detected")
             print(f"✓ GPU 0: {gpu_name}")
             self.device = torch.device("cuda")
+
+            # Performance knobs (safe defaults for RTX 4060 Laptop / Ampere+)
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+                torch.set_float32_matmul_precision("high")
+                self.logger.info(
+                    "[PERF] Enabled TF32 + cudnn.benchmark + matmul_precision=high")
+            except Exception as e:
+                self.logger.warning(
+                    f"[PERF] Failed to set TF32/cudnn knobs: {e}")
         else:
             print("✗ CUDA NOT Available - Running on CPU")
             print(f"  PyTorch version: {torch.__version__}")
             print(f"  CUDA built version: {torch.version.cuda}")
             self.device = torch.device("cpu")
+
+        # AMP (mixed precision)
+        self.use_amp = bool(cuda_available)
+        self.amp_dtype = torch.float16
+        try:
+            self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        except Exception:
+            self.scaler = None
+            self.use_amp = False
+
+        # CUDA memory tracking (helps spot leaks/regressions)
+        self.track_cuda_memory = bool(cuda_available)
+        self._last_cuda_reserved_bytes = None
 
         # Mode Switching
         self.is_graph_level = (self.stage in [1, 2])
@@ -206,11 +255,12 @@ class BaseTrainer:
         self.logger.info(f"Using device: {self.device}")
 
         # History tracking
-        self.history = {"train_loss": [], "val_loss": [], "val_f1": [], "val_auc": []}
+        self.history = {"train_loss": [],
+                        "val_loss": [], "val_f1": [], "val_auc": [], "val_hamming": [], "epoch_times": []}
 
         self.embedding_dims = None
         # Initialize Dataset
-        self.load_data(rand_seed)
+        self.load_data(self.rand_seed)
 
         # Initialize Model
         self.setup_model()
@@ -225,17 +275,25 @@ class BaseTrainer:
     def load_data(self, rand_seed):
         self.logger.info("Loading dataset...")
         # Pass stage to CustomDataset
-        dataset1 = CustomDataset(
-            source="DAppSCAN", load_dir="./save_data2", force_reload=False, rand_seed=rand_seed, stage=self.stage)
-        self.embedding_dims = dataset1.embedding_dims
-        dataset2 = CustomDataset(
-            source="MANDO", load_dir="./save_data3", force_reload=False, rand_seed=rand_seed, stage=self.stage)
-
-        from torch.utils.data import ConcatDataset  # Add this import at the top
+        # dataset1 = CustomDataset(
+        #     source="DAppSCAN", load_dir="/mnt/d/KLTN2/save_data2", force_reload=False, rand_seed=rand_seed, stage=self.stage)
+        # self.embedding_dims = dataset1.embedding_dims
+        # dataset2 = CustomDataset(
+        #     source="MANDO", load_dir="/mnt/d/KLTN2/save_data3", force_reload=False, rand_seed=rand_seed, stage=self.stage)
+        dataset3 = CustomDataset(
+            source="EtherScanIO", load_dir="./save_data", force_reload=False, rand_seed=rand_seed, stage=self.stage)
 
         # Fuse into one dataset
-        self.dataset = ConcatDataset([dataset1, dataset2])
-        self.dataset1 = dataset1  # Keep reference for attributes
+        self.dataset = dataset3  # ConcatDataset([...]) can be re-enabled later
+        self.dataset1 = dataset3  # Keep reference for attributes
+
+        # IMPORTANT: model setup depends on embedding dims from the dataset processor.
+        self.embedding_dims = getattr(self.dataset1, "embedding_dims", None)
+        if not isinstance(self.embedding_dims, dict) or not self.embedding_dims:
+            raise ValueError(
+                "Dataset is missing `embedding_dims` (expected dict like {cfg_node, ast_node, edge}). "
+                "Check `experiments/dataset.py` / `CPG_Processor.embedding_dims`."
+            )
 
         # Stratified Split (80/10/10) to keep label ratios consistent across splits.
         # For Stage 1/2: binary graph labels.
@@ -260,10 +318,10 @@ class BaseTrainer:
 
         labels = []
         if self.stage in [1, 2]:
-            # Extract labels from both datasets
-            for ds in [dataset1, dataset2]:
-                for _, lbl in getattr(ds, "dataset_label", []):
-                    labels.append(_to_binary(lbl))
+            # Extract labels from dataset container (NOT by iterating samples).
+            # `CustomDataset.dataset_label` is a list[(key, tensor_label)] after postprocessing.
+            for _, lbl in getattr(self.dataset1, "dataset_label", []) or []:
+                labels.append(_to_binary(lbl))
         else:
             # For Stage 3, use random split since it's node-level multilabel
             labels = None
@@ -359,7 +417,7 @@ class BaseTrainer:
         else:
             train_idx, val_idx, test_idx = _stratified_indices(
                 labels, rand_seed)
-            
+
         # Persist class balance for Stage 1/2 loss weighting.
         self._split_stats = {
             "train": {"pos": 0, "neg": 0},
@@ -448,12 +506,45 @@ class BaseTrainer:
         # Create Loaders
         def collate_fn(b): return custom_collate(b, stage=self.stage)
 
-        self.train_loader = GraphDataLoader(
-            train_ds, batch_size=self.batch_size, shuffle=True, collate_fn=collate_fn)
-        self.val_loader = GraphDataLoader(
-            val_ds, batch_size=self.batch_size, shuffle=False, collate_fn=collate_fn)
-        self.test_loader = GraphDataLoader(
-            test_ds, batch_size=self.batch_size, shuffle=False, collate_fn=collate_fn)
+        num_workers = 0
+        try:
+            cpu_cnt = os.cpu_count() or 0
+            # Conservative default that helps without over-subscribing.
+            num_workers = int(max(0, min(6, cpu_cnt // 2)))
+            print(
+                f"Using {num_workers} DataLoader workers (CPU count: {cpu_cnt})")
+        except Exception:
+            num_workers = 0
+
+        pin_memory = bool(self.device.type == "cuda")
+        persistent_workers = bool(num_workers > 0)
+
+        def _make_loader(ds, *, shuffle: bool):
+            base_kwargs = dict(
+                batch_size=self.batch_size,
+                shuffle=shuffle,
+                collate_fn=collate_fn,
+            )
+            perf_kwargs = dict(
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=4 if num_workers > 0 else None,
+            )
+            # Remove None values (torch DataLoader rejects None for prefetch_factor)
+            perf_kwargs = {k: v for k, v in perf_kwargs.items()
+                           if v is not None}
+
+            try:
+                return GraphDataLoader(ds, **base_kwargs, **perf_kwargs)
+            except TypeError as e:
+                self.logger.warning(
+                    f"[PERF][DATALOADER] GraphDataLoader rejected perf kwargs ({e}); falling back to defaults.")
+                return GraphDataLoader(ds, **base_kwargs)
+
+        self.train_loader = _make_loader(train_ds, shuffle=True)
+        self.val_loader = _make_loader(val_ds, shuffle=False)
+        self.test_loader = _make_loader(test_ds, shuffle=False)
 
     def setup_model(self):
         # 1. Infer Dimensions from a sample
@@ -467,7 +558,7 @@ class BaseTrainer:
                 "No valid sample found in dataset for model setup.")
 
         # Get rel_names from processor
-        self.rel_names = self.dataset1.CPG_Proccessor.rel_names
+        self.rel_names = self.dataset1.rel_names
         print(self.rel_names)
         # [('cfg_node', 'cf_false', 'cfg_node'),
         # ('cfg_node', 'return_call', 'cfg_node'),
@@ -526,10 +617,18 @@ class BaseTrainer:
                 stage=self.stage,
             ).to(self.device)
 
+        # Apply torch.compile if enabled
+        if self.use_torch_compile:
+            try:
+                self.model = torch.compile(self.model)
+                self.logger.info("[PERF] Torch compile enabled for model.")
+            except Exception as e:
+                self.logger.warning(f"[PERF] Torch compile failed: {e}")
+
         # 4. Optimizer & Loss & Scheduler
         base_optimizer = optim.AdamW(
             self.model.parameters(), lr=self.learning_rate, weight_decay=self.config.weight_decay)
-        self.optimizer = PCGrad(base_optimizer)
+        self.optimizer = base_optimizer
 
         if self.stage in [1, 2]:
             self.scheduler = None
@@ -563,7 +662,8 @@ class BaseTrainer:
 
             if pos > 0 and neg > 0:
                 pos_weight = torch.clamp(
-                    torch.tensor([neg / max(1, pos)], dtype=torch.float32, device=self.device),
+                    torch.tensor([neg / max(1, pos)],
+                                 dtype=torch.float32, device=self.device),
                     min=self.config.class_weight_min, max=self.config.class_weight_max
                 )
                 self.logger.info(
@@ -654,132 +754,237 @@ class BaseTrainer:
             # Stage 3: Labels are Tensors [Total_Nodes, 8]
             g = batch['graph'].to(self.device)
             targets = {
-                'cfg': batch['cfg_labels'].to(self.device) if batch['cfg_labels'] is not None else None,
-                'ast': batch['ast_labels'].to(self.device) if batch['ast_labels'] is not None else None
+                'cfg': batch['cfg_labels'].to(self.device, non_blocking=True) if batch['cfg_labels'] is not None else None,
+                'ast': batch['ast_labels'].to(self.device, non_blocking=True) if batch['ast_labels'] is not None else None
             }
             return g, targets
+
+    def _maybe_log_cuda_memory(self, *, epoch: int, tag: str):
+        if not self.track_cuda_memory or not torch.cuda.is_available():
+            return
+        try:
+            allocated = int(torch.cuda.memory_allocated())
+            reserved = int(torch.cuda.memory_reserved())
+            max_alloc = int(torch.cuda.max_memory_allocated())
+            max_reserved = int(torch.cuda.max_memory_reserved())
+
+            msg = (
+                f"[CUDA MEM][{tag}] epoch={epoch} "
+                f"alloc={allocated/1024**2:.1f}MB resv={reserved/1024**2:.1f}MB "
+                f"max_alloc={max_alloc/1024**2:.1f}MB max_resv={max_reserved/1024**2:.1f}MB"
+            )
+            self.logger.info(msg)
+
+            # Heuristic warning: reserved grows >256MB between epochs (after warmup).
+            if self._last_cuda_reserved_bytes is not None and epoch >= 3:
+                delta = reserved - int(self._last_cuda_reserved_bytes)
+                if delta > 256 * 1024**2:
+                    self.logger.warning(
+                        f"[CUDA MEM] Reserved increased by {delta/1024**2:.1f}MB since last epoch; possible caching/leak or batch-size pressure.")
+            self._last_cuda_reserved_bytes = reserved
+        except Exception:
+            pass
 
     def train(self):
         best_f1 = 0.0
         best_loss = float('inf')
         patience_counter = 0
 
-        for epoch in range(self.num_epochs):
-            self.model.train()
-            epoch_loss = 0
-            grad_norms = []
+        profiler_ctx = torch.profiler.profile(
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                f"{self.log_folder}/profiler"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        ) if self.use_profiler else nullcontext()
 
-            batch_count = 0
-            for batch in tqdm(self.train_loader, desc=f"Ep {epoch+1} Train"):
-                if batch is None:
-                    continue
+        with profiler_ctx as prof:
+            for epoch in range(self.num_epochs):
+                epoch_start_time = time.time()
+                self.model.train()
+                epoch_loss = 0
+                grad_norms = []
 
-                inputs, label_data = self._prepare_batch(batch)
+                if self.track_cuda_memory and torch.cuda.is_available():
+                    try:
+                        torch.cuda.reset_peak_memory_stats()
+                    except Exception:
+                        pass
 
-                self.optimizer.zero_grad()
-                preds = self.model({'graph': inputs})
+                batch_count = 0
+                for batch in tqdm(self.train_loader, desc=f"Ep {epoch+1} Train"):
+                    if batch is None:
+                        continue
 
-                loss = 0
-                if self.is_graph_level:
-                    loss = self._train_step_graph(preds, label_data)
-                else:
-                    loss = self._train_step_node(preds, label_data)
+                    inputs, label_data = self._prepare_batch(batch)
 
-                if loss == 0:
-                    continue
-                # Use PCGrad for backward
-                if isinstance(loss, list):
-                    if isinstance(self.optimizer, PCGrad):
-                        self.optimizer.pc_backward(loss)
-                        epoch_loss += sum(loss_item.item()
-                                            for loss_item in loss)
-                    else:
-                        total_loss = sum(loss)
-                        total_loss.backward()
-                        epoch_loss += total_loss.item()
+                    # Faster zero_grad (set_to_none) when supported
+                    try:
+                        self.optimizer.zero_grad(set_to_none=True)
+                    except TypeError:
+                        self.optimizer.zero_grad()
 
-                else:
-                    # Stage 1/2: single loss
-                    if isinstance(self.optimizer, PCGrad):
-                        self.optimizer.pc_backward([loss])
-                        epoch_loss += loss.item()
-                    else:
-                        loss.backward()
-                        epoch_loss += loss.item()
+                    autocast_ctx = (
+                        torch.amp.autocast('cuda', dtype=self.amp_dtype)
+                        if (self.use_amp and self.device.type == "cuda")
+                        else nullcontext()
+                    )
 
-                # Gradient clipping for stability
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=self.config.grad_clip_max_norm)
-                grad_norms.append(grad_norm.item())
+                    with autocast_ctx:
+                        preds = self.model({'graph': inputs})
 
-                # CRITICAL: Actually update the weights
-                self.optimizer.step()
+                        loss = 0
+                        if self.is_graph_level:
+                            loss = self._train_step_graph(preds, label_data)
+                        else:
+                            loss = self._train_step_node(preds, label_data)
 
-                batch_count += 1
-                # Log first batch to verify training
-                if batch_count == 1:
+                    if loss == 0:
+                        continue
+
+                    # Backward + step (AMP-aware)
                     if isinstance(loss, list):
-                        self.logger.info(
-                            f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {[l.item() for l in loss]} | Grad Norm: {grad_norm:.4f}")
+                        objectives = [loss_item.float() for loss_item in loss]
+                        epoch_loss += float(sum(loss_item.item()
+                                            for loss_item in objectives))
+                        if self.use_amp and self.scaler is not None:
+                            scaled = [self.scaler.scale(loss_item)
+                                      for loss_item in objectives]
+                            if isinstance(self.optimizer, PCGrad):
+                                self.optimizer.pc_backward(scaled)
+                            else:
+                                self.scaler.scale(sum(objectives)).backward()
+                        else:
+                            if isinstance(self.optimizer, PCGrad):
+                                self.optimizer.pc_backward(objectives)
+                            else:
+                                sum(objectives).backward()
                     else:
-                        self.logger.info(
-                            f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
+                        single = loss.float()
+                        epoch_loss += float(single.item())
+                        if self.use_amp and self.scaler is not None:
+                            if isinstance(self.optimizer, PCGrad):
+                                self.optimizer.pc_backward(
+                                    [self.scaler.scale(single)])
+                            else:
+                                self.scaler.scale(single).backward()
+                        else:
+                            if isinstance(self.optimizer, PCGrad):
+                                self.optimizer.pc_backward([single])
+                            else:
+                                single.backward()
 
-                # Step scheduler if using OneCycleLR
-                if self.scheduler is not None and hasattr(self.scheduler, 'step') and len(self.scheduler.__class__.__name__) == 'OneCycleLR':
+                    # Unscale before clipping (AMP)
+                    if self.use_amp and self.scaler is not None:
+                        try:
+                            self.scaler.unscale_(self.optimizer)
+                        except Exception:
+                            pass
+
+                    # Gradient clipping for stability
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=self.config.grad_clip_max_norm)
+                    grad_norms.append(grad_norm.item())
+
+                    # CRITICAL: Actually update the weights
+                    if self.use_amp and self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+
+                    batch_count += 1
+                    # Log first batch to verify training
+                    if batch_count == 1:
+                        if isinstance(loss, list):
+                            self.logger.info(
+                                f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {[loss_item.item() for loss_item in loss]} | Grad Norm: {grad_norm:.4f}")
+                        else:
+                            self.logger.info(
+                                f"[GREEN][TRAIN DEBUG] Epoch {epoch+1} Batch 1 Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
+
+                    # Step scheduler if using OneCycleLR
+                    if self.scheduler is not None and hasattr(self.scheduler, 'step') and len(self.scheduler.__class__.__name__) == 'OneCycleLR':
+                        self.scheduler.step()
+
+                    if self.use_profiler:
+                        prof.step()
+
+                # Step epoch-based schedulers
+                if self.scheduler is not None and self.scheduler.__class__.__name__ == 'CosineAnnealingLR':
                     self.scheduler.step()
 
-            # Step epoch-based schedulers
-            if self.scheduler is not None and self.scheduler.__class__.__name__ == 'CosineAnnealingLR':
-                self.scheduler.step()
+                # Validation
+                val_start_time = time.time()
+                val_metrics = self.evaluate(
+                    self.val_loader, self.fixed_thresholds)
+                val_time = time.time() - val_start_time
 
-            # Validation
-            val_metrics = self.evaluate(self.val_loader, self.fixed_thresholds)
-            avg_loss = epoch_loss / max(len(self.train_loader), 1)
-            avg_grad_norm = sum(grad_norms) / \
-                len(grad_norms) if grad_norms else 0
-            self.logger.info(
-                f"[GREEN]Epoch {epoch+1}: Loss={avg_loss:.4f} | Val Loss={val_metrics['loss']:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f} | Avg Grad Norm={avg_grad_norm:.4f}")
+                train_time = time.time() - epoch_start_time - val_time
+                epoch_total_time = time.time() - epoch_start_time
 
-            # Step scheduler if using ReduceLROnPlateau
-            if self.reduce_on_plateau is not None:
-                prev_lr = self.optimizer.param_groups[0]['lr']
-                self.reduce_on_plateau.step(val_metrics['loss'])
-                current_lr = self.optimizer.param_groups[0]['lr']
-                if current_lr != prev_lr:
+                avg_loss = epoch_loss / max(len(self.train_loader), 1)
+                avg_grad_norm = sum(grad_norms) / \
+                    len(grad_norms) if grad_norms else 0
+                self.logger.info(
+                    f"[GREEN]Epoch {epoch+1}: Loss={avg_loss:.4f} | Val Loss={val_metrics['loss']:.4f} | Val F1={val_metrics['f1']:.4f} | Val AUC={val_metrics['auc']:.4f}" + (f" | Val Hamming={val_metrics['hamming']:.4f}" if self.stage == 3 else "") + f" | Avg Grad Norm={avg_grad_norm:.4f} | Train Time: {train_time:.2f}s | Val Time: {val_time:.2f}s | Total: {epoch_total_time:.2f}s")
+
+                # Step scheduler if using ReduceLROnPlateau
+                if self.reduce_on_plateau is not None:
+                    prev_lr = self.optimizer.param_groups[0]['lr']
+                    self.reduce_on_plateau.step(val_metrics['loss'])
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    if current_lr != prev_lr:
+                        self.logger.info(
+                            f"[PURPLE][TRAIN DEBUG] Learning Rate reduced from {prev_lr:.6f} to {current_lr:.6f}")
+                    else:
+                        self.logger.info(
+                            f"[PURPLE][TRAIN DEBUG] Current Learning Rate: {current_lr:.6f}")
+
+                # Update history
+                self.history["train_loss"].append(
+                    epoch_loss / len(self.train_loader))
+                self.history["val_loss"].append(val_metrics['loss'])
+                self.history["val_f1"].append(val_metrics['f1'])
+                self.history["val_auc"].append(val_metrics['auc'])
+                self.history["val_hamming"].append(val_metrics['hamming'])
+                self.history["epoch_times"].append(epoch_total_time)
+
+                # Save history to JSON
+                with open(f"{self.log_folder}/history.json", 'w') as f:
+                    json.dump(self.history, f)
+
+                # Save history plot if method exists
+                if hasattr(self, 'save_history_plot'):
+                    self.save_history_plot()
+
+                # Checkpoint
+                if val_metrics['f1'] > best_f1:
+                    best_f1 = val_metrics['f1']
+                    patience_counter = 0
+                    torch.save(self.model.state_dict(),
+                               f"{self.log_folder}/best_model.pth")
                     self.logger.info(
-                        f"[PURPLE][TRAIN DEBUG] Learning Rate reduced from {prev_lr:.6f} to {current_lr:.6f}")
+                        f"[PURPLE]New best model saved with Val F1={best_f1:.4f} - Patience reset")
+                    # still update loss bound
+                    if val_metrics['loss'] < best_loss:
+                        best_loss = val_metrics['loss']
+                elif val_metrics['loss'] < best_loss:
+                    best_loss = val_metrics['loss']
+                    patience_counter = 0
+                    self.logger.info(
+                        f"[PURPLE] Best Val Loss={best_loss:.4f} - Patience reset")
                 else:
+                    patience_counter += 1
                     self.logger.info(
-                        f"[PURPLE][TRAIN DEBUG] Current Learning Rate: {current_lr:.6f}")
+                        f"{patience_counter} / {self.patience} patience used")
+                    if patience_counter >= self.patience:
+                        self.logger.info("Early Stopping")
+                        break
 
-            # Update history
-            self.history["train_loss"].append(
-                epoch_loss / len(self.train_loader))
-            self.history["val_loss"].append(val_metrics['loss'])
-            self.history["val_f1"].append(val_metrics['f1'])
-            self.history["val_auc"].append(val_metrics['auc'])
-
-            # Checkpoint
-            if val_metrics['f1'] > best_f1:
-                best_f1 = val_metrics['f1']
-                patience_counter = 0
-                torch.save(self.model.state_dict(),
-                           f"{self.log_folder}/best_model.pth")
-                self.logger.info(
-                    f"[PURPLE]New best model saved with Val F1={best_f1:.4f} - Patience reset")
-            elif val_metrics['loss'] < best_loss:
-                best_loss = val_metrics['loss']
-                patience_counter = 0
-                self.logger.info(
-                    f"[PURPLE] Best Val Loss={best_loss:.4f} - Patience reset")
-            else:
-                patience_counter += 1
-                self.logger.info(
-                    f"{patience_counter} / {self.patience} patience used")
-                if patience_counter >= self.patience:
-                    self.logger.info("Early Stopping")
-                    break
+                self._maybe_log_cuda_memory(epoch=epoch + 1, tag="end_epoch")
 
     def _train_step_graph(self, preds, label_map):
         """Training step for stages 1-2: Graph-level classification with one entity per graph."""
@@ -830,11 +1035,19 @@ class BaseTrainer:
         epoch_loss = 0
 
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="Evaluating"):
                 if batch is None:
                     continue
                 inputs, label_data = self._prepare_batch(batch)
-                preds = self.model({'graph': inputs})
+
+                autocast_ctx = (
+                    torch.amp.autocast('cuda', dtype=self.amp_dtype)
+                    if (self.use_amp and self.device.type == "cuda")
+                    else nullcontext()
+                )
+
+                with autocast_ctx:
+                    preds = self.model({'graph': inputs})
 
                 # Compute loss
                 if self.is_graph_level:
@@ -967,6 +1180,9 @@ class BaseTrainer:
             except Exception:
                 auc = 0.5  # Fail gracefully if only one class present
 
+        # Hamming score for Stage 3
+        hamming = 1 - hamming_loss(y_true, y_pred) if self.stage == 3 else 0
+
         # Classification report
         if self.stage == 3:
             # Per-label report for multilabel Stage 3
@@ -974,6 +1190,7 @@ class BaseTrainer:
                 y_true, y_pred, target_names=OWASP_VULN, zero_division=0, digits=6)
             self.logger.info(
                 f"Per-Label Classification Report (Stage 3):\n{report}")
+            self.logger.info(f"Hamming Loss: {hamming:.6f}")
         else:
             # Binary report for Stages 1/2
             report = classification_report(y_true, y_pred, target_names=[
@@ -983,11 +1200,12 @@ class BaseTrainer:
         return {
             'f1': f1,
             'auc': auc,
+            'hamming': hamming,
             'loss': epoch_loss / len(loader),
             'y_pred': y_pred,
             'y_true': y_true,
             'thresholds': thresholds_used,
-            'y_prob': y_prob if self.stage == 3 else None
+            'y_prob': y_prob
         }
 
     def _eval_step_graph(self, preds, label_map):

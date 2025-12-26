@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Set
 import torch
+import torch.multiprocessing as torch_mp
 import torch.nn as nn
 import dgl
 import networkx as nx
@@ -13,6 +14,51 @@ import os
 from pathlib import Path
 from the_utils import graph_utils
 import traceback
+import multiprocessing
+import concurrent.futures
+from functools import partial
+
+# Ensure torch uses file-system sharing to avoid fd/ancdata issues in multiprocessing
+torch_mp.set_sharing_strategy("file_system")
+
+
+def process_project_worker(project_item, vuln_lookup, device, batch_size, checkpoint_dir, embedding_model_conf):
+    p_name, nx_g = project_item
+    vuln_data = vuln_lookup.get(p_name)
+    if not vuln_data:
+        return None
+
+    # Load model in worker
+    from transformers import AutoModel, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        embedding_model_conf.name, use_fast=True)
+    model = AutoModel.from_pretrained(embedding_model_conf.name)
+    model.eval()
+    model.to(device)
+
+    # Create processor
+    processor = CPG_Processor(tokenizer=tokenizer, model=model, device=device, batch_size=batch_size,
+                              checkpoint_dir=checkpoint_dir, embedding_model_conf=embedding_model_conf)
+
+    # Process (checkpoint is saved inside the processor)
+    result = processor._process_single_project(p_name, nx_g, vuln_data, return_results=False)
+
+    if result:
+        # Cleanup to free memory
+        del processor, model, tokenizer
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return p_name
+    # Cleanup to free memory
+    del processor, model, tokenizer
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return None
 
 
 class EmbeddingModel(nn.Module):
@@ -59,12 +105,15 @@ class CPG_Processor:
         model=None,
         device="cuda" if torch.cuda.is_available() else "cpu",
         batch_size=32,  # Increased from 16
-        checkpoint_dir="./checkpoints/processed_graphs",
+        checkpoint_dir="/mnt/d/KLTN2/DatasetEtherScanio/EtherScanio/checkpoints/processed_graphs",
+        embedding_model_conf=None,
     ):
         self.device = device
         self.batch_size = batch_size
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print("="*40,"\n\n", "CHECKPOINT DIR:", self.checkpoint_dir,"\n","="*40)
+        self.embedding_model_conf = embedding_model_conf
         self.embedding_model = None
         if tokenizer or model:
             print(f"Loading CodeBERT on {device}...")
@@ -103,11 +152,10 @@ class CPG_Processor:
         self.ast_node_label = NodeTypes.AST_NODE.value.lower()
 
         self.embedding_dims = {
-            "cfg_node": 768 + self._compute_struct_feature_size("cfg"),
-            "ast_node": 768 + self._compute_struct_feature_size("ast"),
-            "edge": 768,
+            "cfg_node": embedding_model_conf.embedding_dim + self._compute_struct_feature_size("cfg"),
+            "ast_node": embedding_model_conf.embedding_dim + self._compute_struct_feature_size("ast"),
+            "edge": embedding_model_conf.embedding_dim,
         }
-        self.rel_names = None
 
     def _normalize_node_type(self, raw: Any) -> str:
         """Return canonical node type string: 'cfg_node' or 'ast_node'."""
@@ -691,9 +739,9 @@ class CPG_Processor:
                             "graph": func_graph, "label": func_label}
         return result
 
-    def _prune_stage3(self, stage2_result, vuln_data, max_negative_functions=5):
+    def _prune_stage3(self, stage2_result, vuln_data, max_negative_functions=2):
         """Keep vulnerable blocks + Dataflow/Control Context for vulnerable functions.
-        
+
         Also includes up to max_negative_functions non-vulnerable functions for training balance.
         """
         # Build Vulnerability Map from vuln_data
@@ -766,7 +814,8 @@ class CPG_Processor:
 
         # Then, add some non-vulnerable functions for training balance
         for key, data in stage2_result.items():
-            if data["label"] == 0 and negative_count < max_negative_functions:  # Process non-vulnerable functions
+            # Process non-vulnerable functions
+            if data["label"] == 0 and negative_count < max_negative_functions:
                 func_graph = data["graph"]
                 # For non-vulnerable functions, all node labels are zeros
                 indexed_labels = {"cfg_node": [], "ast_node": []}
@@ -943,12 +992,11 @@ class CPG_Processor:
                     store["texts"])
 
             # print(g)
-            #g.global_to_local = global_to_local
+            # g.global_to_local = global_to_local
             return g
         except Exception as e:
             print(f"Error in nx_to_dgl: {e}")
             traceback.print_exc()
-            sys.exit(1)
             return None
 
     def _get_checkpoint_path(self, project_name: str) -> Path:
@@ -1024,7 +1072,8 @@ class CPG_Processor:
         checkpoint_path = self._get_checkpoint_path(project_name)
         if checkpoint_path.exists():
             try:
-                checkpoint_data = torch.load(checkpoint_path)
+                checkpoint_data = torch.load(
+                    checkpoint_path, weights_only=False)
                 return checkpoint_data
             except Exception as e:
                 print(
@@ -1041,6 +1090,150 @@ class CPG_Processor:
                     str(checkpoint_file.name).replace(".pt", "").strip())
         return processed
 
+    def _process_single_project(self, p_name, nx_g, vuln_data, *, return_results: bool = True):
+        """Process a single project.
+
+        Note: This function always saves a checkpoint on success.
+        If return_results=False, it avoids returning large graph objects and returns only project_name.
+        """
+        print("=" * 40, "\n")
+        print(f"Processing project: {p_name}")
+        print("=" * 40, "\n")
+        if not vuln_data:
+            print(
+                f"  Warning: No vulnerability data for project {p_name}, skipping."
+            )
+            return None
+
+        try:
+            # region main
+            # 1. Build Metadata
+            hierarchy = self._build_hierarchy_map(nx_g)
+
+            # 2. Create Labels
+            s3_lbl, s2_lbl, s1_lbl, original_vuln_count, vuln_map = (
+                self._create_stage_labels(nx_g, hierarchy, vuln_data)
+            )
+
+            # 3. Pruning Cascade
+            s1_g = self._prune_stage1(nx_g, s1_lbl, hierarchy, vuln_map)
+            s2_g = self._prune_stage2(s1_g, s2_lbl, hierarchy, vuln_map)
+            s3_g = self._prune_stage3(s2_g, vuln_data)
+
+            s3_total_nodes = sum(
+                g["graph"].number_of_nodes() for g in s3_g.values()
+            )
+            s3_total_edges = sum(
+                g["graph"].number_of_edges() for g in s3_g.values()
+            )
+
+            print(
+                f"    Stage3 Nodes={s3_total_nodes} Edges={s3_total_edges}")
+            print("=" * 40)
+
+            if s3_total_nodes == 0 or s3_total_edges == 0:
+                print(
+                    f"  Warning: Stage 3 graph is empty for project {p_name}, skipping."
+                )
+                # save empty txt for debug
+                os.makedirs("./debug", exist_ok=True)
+                with open(f"./debug/{p_name}_empty_stage3.txt", "w") as f:
+                    f.write(
+                        f"Project {p_name} has empty Stage 3 graph after pruning.\n"
+                    )
+                return None
+
+            # 5. DGL Conversion (Distinct Graphs per Stage!)
+            dgl_s1 = {k: self.nx_to_dgl(v["graph"])
+                      for k, v in tqdm(s1_g.items(), desc="Conv Stage1")}
+            dgl_s2 = {k: self.nx_to_dgl(v["graph"])
+                      for k, v in tqdm(s2_g.items(), desc="Conv Stage2")}
+            dgl_s3 = {k: self.nx_to_dgl(v["graph"])
+                      for k, v in tqdm(s3_g.items(), desc="Conv Stage3")}
+
+            # Move all tensors to CPU to avoid multiprocessing issues with CUDA
+            def move_to_cpu(graph_dict):
+                for g in graph_dict.values():
+                    for ntype in g.ntypes:
+                        for k, v in g.nodes[ntype].data.items():
+                            if isinstance(v, torch.Tensor):
+                                g.nodes[ntype].data[k] = v.cpu()
+                    for etype in g.etypes:
+                        for k, v in g.edges[etype].data.items():
+                            if isinstance(v, torch.Tensor):
+                                g.edges[etype].data[k] = v.cpu()
+
+            move_to_cpu(dgl_s1)
+            move_to_cpu(dgl_s2)
+            move_to_cpu(dgl_s3)
+
+            # Count vuln labels in stage3
+            stage3_vuln_labels = 0
+            for key, data in s3_g.items():
+                for y in data["label"]["ast_node"]:
+                    if sum(y) > 0:
+                        stage3_vuln_labels += 1
+                        break
+                for x in data["label"]["cfg_node"]:
+                    if sum(x) > 0:
+                        stage3_vuln_labels += 1
+                        break
+            print(
+                f"Vuln labels {stage3_vuln_labels}/{original_vuln_count} intact")
+            # Build stage-keyed labels aligned with the pruned graph keys
+            # - Stage 1: key is "{file}_{contract}"
+            # - Stage 2: key is "{file}_{contract}_{function}"
+            # - Stage 3: key is Stage 2 key (vulnerable functions only)
+            s1_labels_by_key = {k: v.get("label", 0)
+                                for k, v in s1_g.items()}
+            s2_labels_by_key = {k: v.get("label", 0)
+                                for k, v in s2_g.items()}
+            s3_labels_by_key = {k: v.get("label", {})
+                                for k, v in s3_g.items()}
+
+            # Fail-fast contract validation (prevents silent schema drift)
+            self._validate_project_stage_outputs(
+                p_name, 1, dgl_s1, s1_labels_by_key)
+            self._validate_project_stage_outputs(
+                p_name, 2, dgl_s2, s2_labels_by_key)
+            self._validate_project_stage_outputs(
+                p_name, 3, dgl_s3, s3_labels_by_key)
+
+            # 6. Save checkpoint (MUST match current schema)
+            self._save_checkpoint(
+                p_name, dgl_s1, dgl_s2, dgl_s3, s1_labels_by_key, s2_labels_by_key, s3_labels_by_key
+            )
+
+            if return_results:
+                # 7. Prepare results
+                project_results = {
+                    "stage1": {"graphs": dgl_s1, "labels": s1_labels_by_key},
+                    "stage2": {"graphs": dgl_s2, "labels": s2_labels_by_key},
+                    "stage3": {"graphs": dgl_s3, "labels": s3_labels_by_key},
+                }
+
+                print(
+                    f"Processed {p_name}: S1Nodes={sum(g.num_nodes() for g in dgl_s1.values())}, S3Nodes={sum(g.num_nodes() for g in dgl_s3.values())}"
+                )
+
+            # Free memory: delete large intermediate objects
+            del hierarchy, s3_lbl, s2_lbl, s1_lbl, original_vuln_count, vuln_map
+            del s1_g, s2_g, s3_g, dgl_s1, dgl_s2, dgl_s3
+            del s1_labels_by_key, s2_labels_by_key, s3_labels_by_key
+            del nx_g  # delete the input graph
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return (p_name, project_results) if return_results else p_name
+
+        except Exception as e:
+            print(f"\n  Error processing project {p_name}: {e}")
+            traceback.print_exc()
+            print(f"  Skipping {p_name} and continuing...\n")
+            return None
+
     def process_graphs(self, nx_graphs_list, vuln_json_list, resume=True):
         """Main Pipeline execution with checkpointing.
 
@@ -1051,15 +1244,9 @@ class CPG_Processor:
         """
         print(f"Processing {len(nx_graphs_list)} projects...")
 
-        results = {
-            "stage1": {"graphs": [], "labels": []},
-            "stage2": {"graphs": [], "labels": []},
-            "stage3": {"graphs": [], "labels": []},
-        }
-
         # Build Lookup
         vuln_lookup = {item[0]: item[1] for item in vuln_json_list}
-        nx_lookup = {item[0]: item[1] for item in nx_graphs_list}
+        # Note: keep nx_graphs_list as the source of truth; no need to build an extra lookup here.
 
         # Check for already processed projects
         processed_projects = self._get_processed_projects() if resume else set()
@@ -1098,322 +1285,33 @@ class CPG_Processor:
                         break
 
         print(f"Verified {len(verified_checkpoints)} valid checkpoints.")
-        # Process remaining projects first (to avoid OOM)
-        for item in tqdm(projects_to_process, desc="Processing graphs"):
-            p_name, nx_g = item
-            vuln_data = vuln_lookup.get(p_name)
-            print("=" * 40, "\n")
-            print(f"Processing project: {p_name}")
-            print("=" * 40, "\n")
-            if not vuln_data:
-                print(
-                    f"  Warning: No vulnerability data for project {p_name}, skipping."
+        processed_now = []
+        # Process remaining projects in parallel (to speed up)
+        if projects_to_process:
+            # Adjust based on GPU/CPU; keep small to reduce CUDA IPC pressure
+            num_processes = min(len(projects_to_process), 2)
+            print(f"Using {num_processes} processes for parallel processing.")
+            mp_ctx = multiprocessing.get_context(
+                "spawn") if torch.cuda.is_available() else multiprocessing.get_context()
+            with concurrent.futures.ProcessPoolExecutor(max_workers=num_processes, mp_context=mp_ctx) as executor:
+                worker_func = partial(
+                    process_project_worker,
+                    vuln_lookup=vuln_lookup,
+                    device=self.device,
+                    batch_size=self.batch_size,
+                    checkpoint_dir=self.checkpoint_dir,
+                    embedding_model_conf=self.embedding_model_conf,
                 )
-                continue
+                futures = [executor.submit(worker_func, item)
+                           for item in projects_to_process]
+                results_list = [f.result()
+                                for f in concurrent.futures.as_completed(futures)]
 
-            try:
-                # region main
-                # 1. Build Metadata
-                hierarchy = self._build_hierarchy_map(nx_g)
+            # Collect results (project names)
+            processed_now = [res for res in results_list if res]
 
-                # 2. Create Labels
-                s3_lbl, s2_lbl, s1_lbl, original_vuln_count, vuln_map = (
-                    self._create_stage_labels(nx_g, hierarchy, vuln_data)
-                )
+            projects_to_process = []  # Already processed in parallel
 
-                # 3. Pruning Cascade
-                s1_g = self._prune_stage1(nx_g, s1_lbl, hierarchy, vuln_map)
-                s2_g = self._prune_stage2(s1_g, s2_lbl, hierarchy, vuln_map)
-                s3_g = self._prune_stage3(s2_g, vuln_data)
-
-                # # Compute totals and max for stages (since they are dicts of graphs)
-                # s1_total_nodes = sum(
-                #     g["graph"].number_of_nodes() for g in s1_g.values()
-                # )
-                # s1_total_edges = sum(
-                #     g["graph"].number_of_edges() for g in s1_g.values()
-                # )
-                # s1_max_nodes = max(
-                #     (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
-                # )
-                # s1_max_edges = max(
-                #     (g["graph"].number_of_edges() for g in s1_g.values()), default=0
-                # )
-                # s1_min_nodes = min(
-                #     (g["graph"].number_of_nodes() for g in s1_g.values()), default=0
-                # )
-                # s1_min_edges = min(
-                #     (g["graph"].number_of_edges() for g in s1_g.values()), default=0
-                # )
-                # s2_total_nodes = sum(
-                #     g["graph"].number_of_nodes() for g in s2_g.values()
-                # )
-                # s2_total_edges = sum(
-                #     g["graph"].number_of_edges() for g in s2_g.values()
-                # )
-                # s2_max_nodes = max(
-                #     (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
-                # )
-                # s2_max_edges = max(
-                #     (g["graph"].number_of_edges() for g in s2_g.values()), default=0
-                # )
-                # s2_min_nodes = min(
-                #     (g["graph"].number_of_nodes() for g in s2_g.values()), default=0
-                # )
-                # s2_min_edges = min(
-                #     (g["graph"].number_of_edges() for g in s2_g.values()), default=0
-                # )
-                s3_total_nodes = sum(
-                    g["graph"].number_of_nodes() for g in s3_g.values()
-                )
-                s3_total_edges = sum(
-                    g["graph"].number_of_edges() for g in s3_g.values()
-                )
-
-                # print("=" * 40)
-                # print(
-                #     f"    Stage1 Total Nodes={s1_total_nodes} (Max={s1_max_nodes}) (Min={s1_min_nodes}) Edges={s1_total_edges} (Max={s1_max_edges}) (Min={s1_min_edges})"
-                # )
-                # print(
-                #     f"    Stage2 Total Nodes={s2_total_nodes} (Max={s2_max_nodes}) (Min={s2_min_nodes}) Edges={s2_total_edges} (Max={s2_max_edges}) (Min={s2_min_edges})"
-                # )
-                print(
-                    f"    Stage3 Nodes={s3_total_nodes} Edges={s3_total_edges}")
-                print("=" * 40)
-
-                if s3_total_nodes == 0 or s3_total_edges == 0:
-                    print(
-                        f"  Warning: Stage 3 graph is empty for project {p_name}, skipping."
-                    )
-                    # save empty txt for debug
-                    os.makedirs("./debug", exist_ok=True)
-                    with open(f"./debug/{p_name}_empty_stage3.txt", "w") as f:
-                        f.write(
-                            f"Project {p_name} has empty Stage 3 graph after pruning.\n"
-                        )
-                    continue
-
-                # 5. DGL Conversion (Distinct Graphs per Stage!)
-                dgl_s1 = {k: self.nx_to_dgl(v["graph"])
-                          for k, v in tqdm(s1_g.items(), desc="Conv Stage1")}
-                dgl_s2 = {k: self.nx_to_dgl(v["graph"])
-                          for k, v in tqdm(s2_g.items(), desc="Conv Stage2")}
-                dgl_s3 = {k: self.nx_to_dgl(v["graph"])
-                          for k, v in tqdm(s3_g.items(), desc="Conv Stage3")}
-
-                # Count vuln labels in stage3
-                stage3_vuln_labels = 0
-                for key, data in s3_g.items():
-                    for y in data["label"]["ast_node"]:
-                        if sum(y) > 0:
-                            stage3_vuln_labels += 1
-                            break
-                    for x in data["label"]["cfg_node"]:
-                        if sum(x) > 0:
-                            stage3_vuln_labels += 1
-                            break
-                print(
-                    f"Vuln labels {stage3_vuln_labels}/{original_vuln_count} intact")
-                # Build stage-keyed labels aligned with the pruned graph keys
-                # - Stage 1: key is "{file}_{contract}"
-                # - Stage 2: key is "{file}_{contract}_{function}"
-                # - Stage 3: key is Stage 2 key (vulnerable functions only)
-                s1_labels_by_key = {k: v.get("label", 0)
-                                    for k, v in s1_g.items()}
-                s2_labels_by_key = {k: v.get("label", 0)
-                                    for k, v in s2_g.items()}
-                s3_labels_by_key = {k: v.get("label", {})
-                                    for k, v in s3_g.items()}
-
-                # Fail-fast contract validation (prevents silent schema drift)
-                self._validate_project_stage_outputs(
-                    p_name, 1, dgl_s1, s1_labels_by_key)
-                self._validate_project_stage_outputs(
-                    p_name, 2, dgl_s2, s2_labels_by_key)
-                self._validate_project_stage_outputs(
-                    p_name, 3, dgl_s3, s3_labels_by_key)
-
-                # 6. Save checkpoint (MUST match current schema)
-                self._save_checkpoint(
-                    p_name, dgl_s1, dgl_s2, dgl_s3, s1_labels_by_key, s2_labels_by_key, s3_labels_by_key
-                )
-                # os.makedirs("./debug", exist_ok=True)
-                # from networkx.drawing.nx_pydot import write_dot
-                # write_dot(s1_g, f"./debug/{p_name}_stage1.dot")
-                # write_dot(s2_g, f"./debug/{p_name}_stage2.dot")
-                # write_dot(s3_g, f"./debug/{p_name}_stage3.dot")
-                # import json
-                # with open(f"./debug/{p_name}_vulnmap.json", "w") as f:
-                #     json.dump(vuln_map, f, indent=2)
-                # with open(f"./debug/{p_name}_s1labels.json", "w") as f:
-                #     json.dump(s1_lbl, f, indent=2)
-                # with open(f"./debug/{p_name}_s2labels.json", "w") as f:
-                #     json.dump(s2_lbl, f, indent=2)
-                # with open(f"./debug/{p_name}_s3labels.json", "w") as f:
-                #     json.dump(s3_lbl, f, indent=2)
-
-                # 7. Store
-                results["stage1"]["graphs"].append((p_name, dgl_s1))
-                results["stage1"]["labels"].append((p_name, s1_labels_by_key))
-
-                results["stage2"]["graphs"].append((p_name, dgl_s2))
-                results["stage2"]["labels"].append((p_name, s2_labels_by_key))
-
-                results["stage3"]["graphs"].append((p_name, dgl_s3))
-                results["stage3"]["labels"].append((p_name, s3_labels_by_key))
-
-                print(
-                    f"Processed {p_name}: S1Nodes={sum(g.num_nodes() for g in dgl_s1.values())}, S3Nodes={sum(g.num_nodes() for g in dgl_s3.values())}"
-                )
-
-            except Exception as e:
-                print(f"\n  Error processing project {p_name}: {e}")
-                traceback.print_exc()
-                print(f"  Skipping {p_name} and continuing...\n")
-                continue
-
-        # Now load checkpointed projects (after all processing to prevent OOM)
-        print(f"\n{'=' * 60}")
-        print(f"Loading {len(verified_checkpoints)} checkpointed projects...")
-        print(f"{'=' * 60}\n")
-
-        for p_name in tqdm(verified_checkpoints, desc="Loading checkpoints"):
-            checkpoint = self._load_checkpoint(p_name)
-            if checkpoint and self._checkpoint_is_compatible(checkpoint):
-                # Extra safety: validate the loaded checkpoint's stage outputs.
-                self._validate_project_stage_outputs(
-                    p_name, 1, checkpoint["stage1_graph"], checkpoint["stage1_labels"]
-                )
-                self._validate_project_stage_outputs(
-                    p_name, 2, checkpoint["stage2_graph"], checkpoint["stage2_labels"]
-                )
-                self._validate_project_stage_outputs(
-                    p_name, 3, checkpoint["stage3_graph"], checkpoint["stage3_labels"]
-                )
-
-                results["stage1"]["graphs"].append(
-                    (p_name, checkpoint["stage1_graph"]))
-                results["stage1"]["labels"].append(
-                    (p_name, checkpoint["stage1_labels"]))
-
-                results["stage2"]["graphs"].append(
-                    (p_name, checkpoint["stage2_graph"]))
-                results["stage2"]["labels"].append(
-                    (p_name, checkpoint["stage2_labels"]))
-
-                results["stage3"]["graphs"].append(
-                    (p_name, checkpoint["stage3_graph"]))
-                results["stage3"]["labels"].append(
-                    (p_name, checkpoint["stage3_labels"]))
-            else:
-                print(
-                    f"  Warning: Checkpoint for {p_name} is missing/incompatible; will reprocess."
-                )
-                nx_g = nx_lookup.get(p_name)
-                vuln_data = vuln_lookup.get(p_name)
-                if nx_g is None or vuln_data is None:
-                    print(
-                        f"  Warning: Cannot reprocess {p_name} (missing nx graph or vuln data)")
-                    continue
-
-                try:
-                    hierarchy = self._build_hierarchy_map(nx_g)
-                    s3_lbl, s2_lbl, s1_lbl, original_vuln_count, vuln_map = (
-                        self._create_stage_labels(nx_g, hierarchy, vuln_data)
-                    )
-                    s1_g = self._prune_stage1(
-                        nx_g, s1_lbl, hierarchy, vuln_map)
-                    s2_g = self._prune_stage2(
-                        s1_g, s2_lbl, hierarchy, vuln_map)
-                    s3_g = self._prune_stage3(s2_g, vuln_data)
-
-                    dgl_s1 = {k: self.nx_to_dgl(v["graph"])
-                              for k, v in s1_g.items()}
-                    dgl_s2 = {k: self.nx_to_dgl(v["graph"])
-                              for k, v in s2_g.items()}
-                    dgl_s3 = {k: self.nx_to_dgl(v["graph"])
-                              for k, v in s3_g.items()}
-
-                    s1_labels_by_key = {k: v.get("label", 0)
-                                        for k, v in s1_g.items()}
-                    s2_labels_by_key = {k: v.get("label", 0)
-                                        for k, v in s2_g.items()}
-                    s3_labels_by_key = {k: v.get("label", {})
-                                        for k, v in s3_g.items()}
-
-                    self._validate_project_stage_outputs(
-                        p_name, 1, dgl_s1, s1_labels_by_key)
-                    self._validate_project_stage_outputs(
-                        p_name, 2, dgl_s2, s2_labels_by_key)
-                    self._validate_project_stage_outputs(
-                        p_name, 3, dgl_s3, s3_labels_by_key)
-
-                    self._save_checkpoint(
-                        p_name, dgl_s1, dgl_s2, dgl_s3, s1_labels_by_key, s2_labels_by_key, s3_labels_by_key
-                    )
-
-                    results["stage1"]["graphs"].append((p_name, dgl_s1))
-                    results["stage1"]["labels"].append(
-                        (p_name, s1_labels_by_key))
-                    results["stage2"]["graphs"].append((p_name, dgl_s2))
-                    results["stage2"]["labels"].append(
-                        (p_name, s2_labels_by_key))
-                    results["stage3"]["graphs"].append((p_name, dgl_s3))
-                    results["stage3"]["labels"].append(
-                        (p_name, s3_labels_by_key))
-                except Exception as e:
-                    print(f"  Warning: Failed to reprocess {p_name}: {e}")
-                    traceback.print_exc()
-
-        print("\nFinal Results Schema:")
-        for stage in ["stage1", "stage2", "stage3"]:
-            graphs = results[stage]["graphs"]
-            labels = results[stage]["labels"]
-            print(f"  {stage}: graphs={len(graphs)}, labels={len(labels)}")
-
-            if graphs:
-                sample_project, sample_graphs = graphs[0]
-                print(f"    Sample project: {sample_project}")
-                print(
-                    f"    Sample graphs container type: {type(sample_graphs)}")
-
-                if isinstance(sample_graphs, dict):
-                    subkeys = list(sample_graphs.keys())
-                    print(f"    Subgraphs: {len(subkeys)}")
-                    print(
-                        f"    First subkey: {subkeys[0] if subkeys else None}")
-                    if subkeys:
-                        g0 = sample_graphs[subkeys[0]]
-                        print(f"    First subgraph type: {type(g0)}")
-                else:
-                    print(f"    Sample graph type: {type(sample_graphs)}")
-
-            if labels:
-                sample_project, sample_labels = labels[0]
-                print(f"    Sample label project: {sample_project}")
-                print(
-                    f"    Sample labels container type: {type(sample_labels)}")
-                if isinstance(sample_labels, dict):
-                    label_keys = list(sample_labels.keys())
-                    print(f"    Label keys: {len(label_keys)}")
-                    if label_keys:
-                        k0 = label_keys[0]
-                        v0 = sample_labels[k0]
-                        print(f"    First label key: {k0}")
-                        if isinstance(v0, dict):
-                            print(
-                                f"    First label dict keys: {list(v0.keys())}")
-                        else:
-                            print(f"    First label type: {type(v0)}")
-
-        # Collect rel_names
-        if self.rel_names is None:
-            self.rel_names = set()
-            for stage in ["stage1", "stage2", "stage3"]:
-                for _, graph_dict in results[stage]["graphs"]:
-                    for g in graph_dict.values():
-                        if hasattr(g, "canonical_etypes"):
-                            self.rel_names.update(g.canonical_etypes)
-            self.rel_names = list(self.rel_names)
-
-        return results
+        # No temp partial files: rely on checkpoints as the durable intermediate.
+        all_available = list(dict.fromkeys(list(verified_checkpoints) + list(processed_now)))
+        return all_available

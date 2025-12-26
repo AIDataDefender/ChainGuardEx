@@ -24,7 +24,7 @@ class EdgeGatedHeteroGINLayer(nn.Module):
         # Edge encoder → scalar gate
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_dim, edge_dim // 2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(edge_dim // 2, 1),
         )
 
@@ -131,7 +131,7 @@ class CascadedHeteroModel(BaseModel):
             model_type="EdgeDenoisedHGIN",
         )
 
-        # Node projection layers (non-negotiable input dims)
+        # Node projection layers 
         self.node_proj = nn.ModuleDict({
             ntype: nn.Sequential(
                 nn.Linear(node_dims[ntype], hidden_dim),

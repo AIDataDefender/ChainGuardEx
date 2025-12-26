@@ -4,7 +4,7 @@ import traceback
 import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, recall_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, recall_score, roc_curve, auc
 import numpy as np
 from sklearn.metrics import f1_score, precision_score, roc_auc_score
 from base_trainer import BaseTrainer
@@ -20,9 +20,9 @@ class TrainerWithAnalysis(BaseTrainer):
     Stage (Graph vs Node Classification).
     """
 
-    def __init__(self, do_test_data=True, **kwargs):
+    def __init__(self, do_test_data=True, use_torch_compile=None, use_profiler=None, **kwargs):
         self.do_test_data = do_test_data
-        super().__init__(**kwargs)
+        super().__init__(use_torch_compile=use_torch_compile, use_profiler=use_profiler, **kwargs)
 
         # Store training start time for efficiency tracking
         self.start_time = time.time()
@@ -166,13 +166,11 @@ class TrainerWithAnalysis(BaseTrainer):
         self.logger.info(
             f"Model Summary: {total_params:,} Total Params ({trainable_params:,} Trainable)")
 
-    def visualize_results(self, test_metrics=None):
-        """Generate Stage-specific visualizations."""
+    def save_history_plot(self):
+        """Save training history plot."""
         try:
-            sns.set_theme(style="whitegrid")
             os.makedirs(f"{self.log_folder}/viz", exist_ok=True)
 
-            # 1. Training History
             if self.history["train_loss"]:
                 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -189,6 +187,9 @@ class TrainerWithAnalysis(BaseTrainer):
                              label="Macro F1", color="green")
                 axes[1].plot(self.history["val_auc"],
                              label="AUC", color="purple")
+                if self.stage == 3:
+                    axes[1].plot(self.history["val_hamming"],
+                                 label="Hamming Score", color="orange")
                 axes[1].set_title("Validation Metrics")
                 axes[1].set_xlabel("Epoch")
                 axes[1].legend()
@@ -197,7 +198,18 @@ class TrainerWithAnalysis(BaseTrainer):
                     f"{self.log_folder}/viz/history_stage{self.stage}.png")
                 plt.close()
 
-            # 2. Confusion Matrix (Binary View)
+        except Exception as e:
+            self.logger.error(f"History plot save failed: {e}")
+            traceback.print_exc()
+
+    def visualize_results(self, test_metrics=None):
+        """Generate Stage-specific visualizations."""
+        try:
+            sns.set_theme(style="whitegrid")
+            os.makedirs(f"{self.log_folder}/viz", exist_ok=True)
+
+            # 1. Training History
+            self.save_history_plot()
             if test_metrics and "y_pred" in test_metrics:
                 y_true = test_metrics["y_true"]
                 y_pred = test_metrics["y_pred"]
@@ -240,8 +252,8 @@ class TrainerWithAnalysis(BaseTrainer):
                     if "y_prob" in test_metrics:
                         y_prob = test_metrics["y_prob"]
                         if len(np.unique(y_true[:, c])) == 2:
-                            auc = roc_auc_score(y_true[:, c], y_prob[:, c])
-                            auc_per_class.append(auc)
+                            auc_val = roc_auc_score(y_true[:, c], y_prob[:, c])
+                            auc_per_class.append(auc_val)
                         else:
                             auc_per_class.append(0.5)
                     else:
@@ -283,6 +295,46 @@ class TrainerWithAnalysis(BaseTrainer):
                 plt.tight_layout()
                 plt.savefig(f"{self.log_folder}/viz/per_class_cm_stage{self.stage}.png")
                 plt.close()
+
+            # 5. ROC AUC Curves
+            if test_metrics and "y_prob" in test_metrics and "y_true" in test_metrics:
+                y_true = test_metrics["y_true"]
+                y_prob = test_metrics["y_prob"]
+
+                if self.stage in [1, 2]:
+                    # Single ROC curve for binary classification
+                    fpr, tpr, _ = roc_curve(y_true, y_prob)
+                    roc_auc = auc(fpr, tpr)
+                    plt.figure(figsize=(8, 6))
+                    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+                    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                    plt.xlim([0.0, 1.0])
+                    plt.ylim([0.0, 1.05])
+                    plt.xlabel('False Positive Rate')
+                    plt.ylabel('True Positive Rate')
+                    plt.title(f'Stage {self.stage} ROC Curve')
+                    plt.legend(loc="lower right")
+                    plt.savefig(f"{self.log_folder}/viz/roc_stage{self.stage}.png")
+                    plt.close()
+
+                elif self.stage == 3:
+                    # Per-class ROC curves
+                    num_classes = y_true.shape[1]
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    for c in range(num_classes):
+                        if len(np.unique(y_true[:, c])) == 2:
+                            fpr, tpr, _ = roc_curve(y_true[:, c], y_prob[:, c])
+                            roc_auc = auc(fpr, tpr)
+                            ax.plot(fpr, tpr, lw=2, label=f'{OWASP_VULN[c]} (AUC = {roc_auc:.2f})')
+                    ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                    ax.set_xlim([0.0, 1.0])
+                    ax.set_ylim([0.0, 1.05])
+                    ax.set_xlabel('False Positive Rate')
+                    ax.set_ylabel('True Positive Rate')
+                    ax.set_title(f'Stage {self.stage} ROC Curves per Class')
+                    ax.legend(loc="lower right")
+                    plt.savefig(f"{self.log_folder}/viz/roc_per_class_stage{self.stage}.png")
+                    plt.close()
         except Exception as e:
             self.logger.error(f"Visualization failed: {e}")
             traceback.print_exc()
@@ -346,6 +398,12 @@ class CascadeOrchestrator:
                         model_type=model_type,
                     )
 
+                    # Print model summary
+                    print("Model Summary:")
+                    total_params = sum(p.numel() for p in trainer.model.parameters())
+                    trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+                    print(f"Total Params: {total_params:,}, Trainable: {trainable_params:,}")
+
                     # 2. Train
                     trainer.train()
 
@@ -362,6 +420,8 @@ class CascadeOrchestrator:
                     # Free memory
                     del trainer
                     torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
 
             except Exception:
                 print(f"!!! CRITICAL FAILURE IN STAGE {stage} !!!")
@@ -377,7 +437,7 @@ class CascadeOrchestrator:
         print("="*80)
 
         # Header
-        print(f"{'Stage':<10} | {'Role':<15} | {'F1':<8} | {'AUC':<8} | {'Recall':<8} | {'Time (m)':<10} | {'Params':<10}")
+        print(f"{'Stage':<10} | {'Role':<15} | {'F1':<8} | {'AUC':<8} | {'Hamming':<8} | {'Time (m)':<10} | {'Params':<10}")
         print("-" * 85)
 
         roles = {1: "Gatekeeper", 2: "Locator", 3: "Specialist"}
@@ -396,12 +456,10 @@ class CascadeOrchestrator:
                 time_mins = data["time"] / 60
                 role = f"{roles[stage]}:{model_name}"
                 print(
-                    f"{stage:<10} | {role:<15} | {m['f1']:.4f}  | {m['auc']:.4f}  | {'--':<8} | {time_mins:.1f}      | {params:,}"
+                    f"{stage:<10} | {role:<15} | {m['f1']:.4f}  | {m['auc']:.4f}  | {m.get('hamming', '--'):<8} | {time_mins:.1f}      | {params:,}"
                 )
 
         print("-" * 75)
-        print("Note: In a deployed cascade, Stage 1 filters ~90% of traffic,")
-        print("      preventing Stage 3 (Heavy) from running on benign contracts.")
         print("="*80 + "\n")
 
 
