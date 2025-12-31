@@ -130,6 +130,7 @@ class CascadedHeteroModel(BaseModel):
             pooling_type=pooling_type,
             model_type="EdgeDenoisedHGIN",
         )
+        self.model_type = "EdgeDenoisedHGIN"
 
         # Node projection layers 
         self.node_proj = nn.ModuleDict({

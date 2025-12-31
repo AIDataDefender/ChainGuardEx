@@ -11,7 +11,6 @@ import traceback
 import dgl
 import argparse
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add the workspace root to Python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
@@ -1073,70 +1072,68 @@ class CustomDataset(Dataset):
         else:
             # New sharded way
             logger.info(f"Loading Stage {s} from shards...")
-            shard_paths = []
+            # First, find all shard indices
+            shard_indices = []
             shard_idx = 0
             while True:
                 g_shard_path = g_path.replace('.pt', f'_{shard_idx}.pt')
                 l_shard_path = l_path.replace('.pt', f'_{shard_idx}.pt')
                 if not (os.path.exists(g_shard_path) and os.path.exists(l_shard_path)):
                     break
-                shard_paths.append((g_shard_path, l_shard_path))
+                shard_indices.append(shard_idx)
                 shard_idx += 1
-            if not shard_paths:
+            if not shard_indices:
                 logger.warning(
                     f"No shards found for Stage {s} at {g_path}")
                 return False
 
-            # Parallel load shards
-            def load_shard(g_path, l_path):
+            # Load shards with progress bar
+            for shard_idx in tqdm(shard_indices, desc=f"Loading Stage {s} shards"):
+                g_shard_path = g_path.replace('.pt', f'_{shard_idx}.pt')
+                l_shard_path = l_path.replace('.pt', f'_{shard_idx}.pt')
                 try:
                     chunk_g = torch.load(
-                        g_path, map_location="cpu", weights_only=False, mmap=True)
+                        g_shard_path, map_location="cpu", weights_only=False, mmap=True)
                 except TypeError:
-                    chunk_g = torch.load(g_path, map_location="cpu")
+                    chunk_g = torch.load(g_shard_path, map_location="cpu")
 
                 try:
                     chunk_l = torch.load(
-                        l_path, map_location="cpu", weights_only=False, mmap=True)
+                        l_shard_path, map_location="cpu", weights_only=False, mmap=True)
                 except TypeError:
-                    chunk_l = torch.load(l_path, map_location="cpu")
-                return chunk_g, chunk_l
+                    chunk_l = torch.load(l_shard_path, map_location="cpu")
 
-            with ThreadPoolExecutor(max_workers=min(len(shard_paths), 4)) as executor:
-                futures = [executor.submit(load_shard, g_p, l_p) for g_p, l_p in shard_paths]
-                for future in as_completed(futures):
-                    chunk_g, chunk_l = future.result()
-                    # Stream-deflatten to reduce peak memory.
-                    if not isinstance(chunk_g, list) or not isinstance(chunk_l, list):
+                # Stream-deflatten to reduce peak memory.
+                if not isinstance(chunk_g, list) or not isinstance(chunk_l, list):
+                    raise TypeError(
+                        f"Stage {s} shard {shard_idx}: expected list chunks, got graphs={type(chunk_g)} labels={type(chunk_l)}"
+                    )
+                if len(chunk_g) != len(chunk_l):
+                    raise ValueError(
+                        f"Stage {s} shard {shard_idx}: chunk size mismatch graphs={len(chunk_g)} labels={len(chunk_l)}"
+                    )
+
+                for gi, li in zip(chunk_g, chunk_l):
+                    if not (isinstance(gi, (list, tuple)) and len(gi) == 3):
                         raise TypeError(
-                            f"Stage {s} shard: expected list chunks, got graphs={type(chunk_g)} labels={type(chunk_l)}"
+                            f"Stage {s} shard {shard_idx}: bad graph item type={type(gi)}"
                         )
-                    if len(chunk_g) != len(chunk_l):
+                    if not (isinstance(li, (list, tuple)) and len(li) == 3):
+                        raise TypeError(
+                            f"Stage {s} shard {shard_idx}: bad label item type={type(li)}"
+                        )
+                    gp, gsub, gobj = gi
+                    lp, lsub, lobj = li
+                    if gp != lp or gsub != lsub:
                         raise ValueError(
-                            f"Stage {s} shard: chunk size mismatch graphs={len(chunk_g)} labels={len(chunk_l)}"
+                            f"Stage {s} shard {shard_idx}: graph/label misaligned: "
+                            f"graph=({gp},{gsub}) label=({lp},{lsub})"
                         )
+                    graphs_by_project.setdefault(gp, {})[gsub] = gobj
+                    labels_by_project.setdefault(lp, {})[lsub] = lobj
 
-                    for gi, li in zip(chunk_g, chunk_l):
-                        if not (isinstance(gi, (list, tuple)) and len(gi) == 3):
-                            raise TypeError(
-                                f"Stage {s} shard: bad graph item type={type(gi)}"
-                            )
-                        if not (isinstance(li, (list, tuple)) and len(li) == 3):
-                            raise TypeError(
-                                f"Stage {s} shard: bad label item type={type(li)}"
-                            )
-                        gp, gsub, gobj = gi
-                        lp, lsub, lobj = li
-                        if gp != lp or gsub != lsub:
-                            raise ValueError(
-                                f"Stage {s} shard: graph/label misaligned: "
-                                f"graph=({gp},{gsub}) label=({lp},{lsub})"
-                            )
-                        graphs_by_project.setdefault(gp, {})[gsub] = gobj
-                        labels_by_project.setdefault(lp, {})[lsub] = lobj
-
-                    # Free shard chunks promptly
-                    del chunk_g, chunk_l
+                # Free shard chunks promptly
+                del chunk_g, chunk_l
         if is_single:
             print(
                 f"Loaded {len(flattened_graphs)} graphs and {len(flattened_labels)} labels for stage {s}")
@@ -1168,7 +1165,7 @@ class CustomDataset(Dataset):
             total_label_items = sum(len(ldict)
                                     for ldict in labels_by_project.values())
             print(
-                f"Loaded {total_graph_items} graphs and {total_label_items} labels for stage {s} (parallel shards)")
+                f"Loaded {total_graph_items} graphs and {total_label_items} labels for stage {s} (streamed shards)")
 
         total_graph_items = sum(len(gdict)
                                 for gdict in graphs_by_project.values())
@@ -1208,109 +1205,6 @@ class CustomDataset(Dataset):
                 pass
 
         return True
-
-    def _process_single_item(self, p_name_g, subkey, graph_data, lbl):
-        full_key = f"{p_name_g}@{subkey}"
-
-        if self.stage in [1, 2]:
-            g = graph_data
-
-            if not hasattr(g, "ntypes"):
-                raise TypeError(
-                    f"Stage 1/2 expects a DGL heterograph, got {type(g)} for {full_key}")
-
-            if not isinstance(lbl, int) or lbl not in (0, 1):
-                raise ValueError(
-                    f"Stage {self.stage} label must be int 0/1 for {full_key}, got {lbl} ({type(lbl)})"
-                )
-
-            g = standardize_heterograph(
-                g,
-                getattr(self.CPG_Proccessor, "rel_names", None),
-                self.embedding_dims,
-            )
-
-            graph_tuple = (full_key, g)
-            label_tuple = (full_key, torch.tensor(lbl, dtype=torch.float32))
-
-        else:
-            g = graph_data
-            # Stage 3: fail-fast contract check: label rows must match node counts.
-            if not hasattr(g, "ntypes"):
-                raise TypeError(
-                    f"Stage 3 expects a DGL heterograph, got {type(g)} for {full_key}")
-
-            if not isinstance(lbl, dict) or ("cfg_node" not in lbl or "ast_node" not in lbl):
-                raise TypeError(
-                    f"Stage 3 label must be dict with cfg_node/ast_node for {full_key}, got {type(lbl)}"
-                )
-
-            expected_dim = len(
-                getattr(_graph_utils, "OWASP_VULN", []))
-
-            cfg_nodes = g.num_nodes(
-                "cfg_node") if "cfg_node" in g.ntypes else 0
-            ast_nodes = g.num_nodes(
-                "ast_node") if "ast_node" in g.ntypes else 0
-
-            cfg_rows = int(lbl.get("cfg_node", []) and len(
-                lbl.get("cfg_node", [])) or 0)
-            ast_rows = int(lbl.get("ast_node", []) and len(
-                lbl.get("ast_node", [])) or 0)
-
-            if cfg_rows != cfg_nodes:
-                raise ValueError(
-                    f"Stage 3 contract mismatch for CFG {full_key}"
-                )
-            if ast_rows != ast_nodes:
-                raise ValueError(
-                    f"Stage 3 contract mismatch for AST {full_key}"
-                )
-
-            # Standardize heterograph schema so batching never drops data.
-            try:
-                g = standardize_heterograph(
-                    g,
-                    getattr(self.CPG_Proccessor,
-                            "rel_names", None),
-                    self.embedding_dims,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Stage 3 schema standardization failed for {full_key}: {e}")
-                return None
-
-            # Materialize label tensors with stable 2D shape [N, expected_dim]
-            # (torch.tensor([]) would otherwise create a 1D empty tensor).
-            cfg_list = lbl.get("cfg_node", []) or []
-            ast_list = lbl.get("ast_node", []) or []
-            cfg_tensor = torch.tensor(
-                cfg_list, dtype=torch.float32)
-            ast_tensor = torch.tensor(
-                ast_list, dtype=torch.float32)
-
-            if cfg_tensor.numel() == 0:
-                cfg_tensor = torch.zeros(
-                    (0, expected_dim), dtype=torch.float32)
-            elif cfg_tensor.dim() == 1 and cfg_tensor.numel() == expected_dim:
-                cfg_tensor = cfg_tensor.unsqueeze(0)
-
-            if ast_tensor.numel() == 0:
-                ast_tensor = torch.zeros(
-                    (0, expected_dim), dtype=torch.float32)
-            elif ast_tensor.dim() == 1 and ast_tensor.numel() == expected_dim:
-                ast_tensor = ast_tensor.unsqueeze(0)
-
-            graph_tuple = (full_key, g)
-            label_tuple = (
-                full_key,
-                {
-                    "cfg_node": cfg_tensor,
-                    "ast_node": ast_tensor,
-                },
-            )
-
-        return graph_tuple, label_tuple
 
     def postprocessing(self):
         dataset_graph_temp = []
@@ -1363,7 +1257,6 @@ class CustomDataset(Dataset):
             )
 
         try:
-            items_to_process = []
             for p_name_g, graphs_data in graphs_by_project.items():
                 labels_data = labels_by_project.get(p_name_g, {})
 
@@ -1373,27 +1266,121 @@ class CustomDataset(Dataset):
                     )
                     continue
 
-                # Collect items for parallel processing
+                # Align graph+label per subkey (so __getitem__ is always consistent)
                 for subkey, graph_data in graphs_data.items():
+                    full_key = f"{p_name_g}@{subkey}"
+
                     lbl = labels_data.get(subkey)
                     if lbl is None:
                         raise ValueError(
-                            f"Missing label for {p_name_g}@{subkey}. This indicates stage graph/label keys are inconsistent."
+                            f"Missing label for {full_key}. This indicates stage graph/label keys are inconsistent."
                         )
-                    items_to_process.append((p_name_g, subkey, graph_data, lbl))
 
-            # Process items in parallel
-            import concurrent.futures
-            max_workers = min(4, len(items_to_process)) if len(items_to_process) > 0 else 1
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                results = list(executor.map(lambda item: self._process_single_item(*item), items_to_process))
+                    if self.stage in [1, 2]:
+                        g = graph_data
 
-            # Collect results
-            for result in results:
-                if result is not None:
-                    graph_tuple, label_tuple = result
-                    dataset_graph_temp.append(graph_tuple)
-                    dataset_label_temp.append(label_tuple)
+                        if not hasattr(g, "ntypes"):
+                            raise TypeError(
+                                f"Stage 1/2 expects a DGL heterograph, got {type(g)} for {full_key}")
+
+                        if not isinstance(lbl, int) or lbl not in (0, 1):
+                            raise ValueError(
+                                f"Stage {self.stage} label must be int 0/1 for {full_key}, got {lbl} ({type(lbl)})"
+                            )
+                    else:
+                        g = graph_data
+                        # Stage 3: fail-fast contract check: label rows must match node counts.
+                        if not hasattr(g, "ntypes"):
+                            raise TypeError(
+                                f"Stage 3 expects a DGL heterograph, got {type(g)} for {full_key}")
+
+                        if not isinstance(lbl, dict) or ("cfg_node" not in lbl or "ast_node" not in lbl):
+                            raise TypeError(
+                                f"Stage 3 label must be dict with cfg_node/ast_node for {full_key}, got {type(lbl)}"
+                            )
+
+                        expected_dim = len(
+                            getattr(_graph_utils, "OWASP_VULN", []))
+
+                        cfg_nodes = g.num_nodes(
+                            "cfg_node") if "cfg_node" in g.ntypes else 0
+                        ast_nodes = g.num_nodes(
+                            "ast_node") if "ast_node" in g.ntypes else 0
+
+                        cfg_rows = int(lbl.get("cfg_node", []) and len(
+                            lbl.get("cfg_node", [])) or 0)
+                        ast_rows = int(lbl.get("ast_node", []) and len(
+                            lbl.get("ast_node", [])) or 0)
+
+                        if cfg_rows != cfg_nodes:
+                            raise ValueError(
+                                f"Stage 3 contract mismatch for CFG {full_key}"
+                            )
+                        if ast_rows != ast_nodes:
+                            raise ValueError(
+                                f"Stage 3 contract mismatch for AST {full_key}"
+                            )
+
+                        # Standardize heterograph schema so batching never drops data.
+                        try:
+                            g = standardize_heterograph(
+                                g,
+                                getattr(self.CPG_Proccessor,
+                                        "rel_names", None),
+                                self.embedding_dims,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Stage 3 schema standardization failed for {full_key}: {e}")
+                            if pbar is not None:
+                                pbar.update(1)
+                            continue
+
+                        # Materialize label tensors with stable 2D shape [N, expected_dim]
+                        # (torch.tensor([]) would otherwise create a 1D empty tensor).
+                        cfg_list = lbl.get("cfg_node", []) or []
+                        ast_list = lbl.get("ast_node", []) or []
+                        cfg_tensor = torch.tensor(
+                            cfg_list, dtype=torch.float32)
+                        ast_tensor = torch.tensor(
+                            ast_list, dtype=torch.float32)
+
+                        if cfg_tensor.numel() == 0:
+                            cfg_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+                        elif cfg_tensor.dim() == 1 and cfg_tensor.numel() == expected_dim:
+                            cfg_tensor = cfg_tensor.unsqueeze(0)
+
+                        if ast_tensor.numel() == 0:
+                            ast_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+                        elif ast_tensor.dim() == 1 and ast_tensor.numel() == expected_dim:
+                            ast_tensor = ast_tensor.unsqueeze(0)
+
+                    if self.stage in [1, 2]:
+                        g = standardize_heterograph(
+                            g,
+                            getattr(self.CPG_Proccessor, "rel_names", None),
+                            self.embedding_dims,
+                        )
+
+                    dataset_graph_temp.append((full_key, g))
+
+                    if self.stage in [1, 2]:
+                        dataset_label_temp.append(
+                            (full_key, torch.tensor(lbl, dtype=torch.float32))
+                        )
+                    else:
+                        dataset_label_temp.append(
+                            (
+                                full_key,
+                                {
+                                    "cfg_node": cfg_tensor,
+                                    "ast_node": ast_tensor,
+                                },
+                            )
+                        )
+
                     if pbar is not None:
                         pbar.update(1)
 

@@ -30,7 +30,6 @@ class BaseModel(nn.Module):
         self.ntypes = list(node_dims.keys())
         self.rels = list(rel_names)
 
-        
         self.h = None  # will be set by subclass
 
         if self.stage == "3":
@@ -87,7 +86,7 @@ class BaseModel(nn.Module):
             if g.num_nodes('ast_node') > 0:
                 g.nodes['ast_node'].data['h'] = ast_feats
                 ast_pooled = dgl.readout_nodes(
-                    g, 'h', ntype='ast_node', op=self.pooling_type)
+                    g, 'h', ntype='ast_node', op='sum')
             else:
                 ast_pooled = torch.zeros(
                     g.batch_size, self.hidden_dim, device=g.device)
@@ -95,7 +94,7 @@ class BaseModel(nn.Module):
             if g.num_nodes('cfg_node') > 0:
                 g.nodes['cfg_node'].data['h'] = cfg_feats
                 cfg_pooled = dgl.readout_nodes(
-                    g, 'h', ntype='cfg_node', op=self.pooling_type)
+                    g, 'h', ntype='cfg_node', op='sum')
             else:
                 cfg_pooled = torch.zeros(
                     g.batch_size, self.hidden_dim, device=g.device)

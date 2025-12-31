@@ -18,14 +18,14 @@ from dgl.nn.pytorch import (
 
 
 SUPPORTED_MODEL_TYPES = (
-    "HGT",
+    # "HGT",
     "GCN",
-    "GraphSAGE", #
-    "GIN", #
-    "GINE",
-    "GatedGCN",
+    "GraphSAGE",
+    "GIN",
+    # "GINE",
+    # "GatedGCN",
     "GATv2_no_edge",
-    "GATv2_with_edges",
+    # "GATv2_with_edges",
 )
 
 # ============================================================
@@ -187,7 +187,15 @@ class GatedGCNConvWrapper(nn.Module):
 
 
 class GATv2EdgeWrapper(nn.Module):
-    def __init__(self, src_node_in, dst_node_in, edge_in, hidden_dim, heads=4):
+    def __init__(
+        self,
+        src_node_in,
+        dst_node_in,
+        edge_in,
+        hidden_dim,
+        heads=4,
+        allow_zero_in_degree: bool = True,
+    ):
         super().__init__()
         if hidden_dim % heads != 0:
             raise ValueError(
@@ -200,6 +208,7 @@ class GATv2EdgeWrapper(nn.Module):
             hidden_dim // heads,
             num_heads=heads,
             edge_feats=hidden_dim,
+            allow_zero_in_degree=allow_zero_in_degree,
         )
 
     def forward(self, g, feat_src, feat_dst, feat_edge):
@@ -223,11 +232,43 @@ class GINConvWrapper(nn.Module):
         self.proj = NodePairProjector(src_node_in, dst_node_in, hidden_dim)
         # Keep a learnable transformation after aggregation.
         self.conv = GINConv(nn.Linear(hidden_dim, hidden_dim))
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, g, feat_src, feat_dst):
+    def forward(self, g, feat_src, feat_dst, feat_edge=None):
         src_h, dst_h = self.proj(feat_src, feat_dst)
         out = self.conv(g, (src_h, dst_h))
+        out = torch.nan_to_num(out, nan=0.0)
+        out = self.norm(out)
+        out = torch.nan_to_num(out, nan=0.0)
         return out
+
+
+class GraphSAGEWrapper(nn.Module):
+    def __init__(self, src_node_in, dst_node_in, hidden_dim):
+        super().__init__()
+        self.proj = NodePairProjector(src_node_in, dst_node_in, hidden_dim)
+        self.conv = SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean')
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, g, feat_src, feat_dst, feat_edge=None):
+        src_h, dst_h = self.proj(feat_src, feat_dst)
+        out = self.conv(g, (src_h, dst_h))
+        out = torch.nan_to_num(out, nan=0.0)
+        out = self.norm(out)
+        out = torch.nan_to_num(out, nan=0.0)
+        return out
+
+
+class GCNWrapper(nn.Module):
+    def __init__(self, src_node_in, dst_node_in, hidden_dim):
+        super().__init__()
+        self.proj = NodePairProjector(src_node_in, dst_node_in, hidden_dim)
+        self.conv = GraphConv(hidden_dim, hidden_dim,
+                              allow_zero_in_degree=True)
+
+    def forward(self, g, feat_src, feat_dst, feat_edge=None):
+        src_h, dst_h = self.proj(feat_src, feat_dst)
+        return self.conv(g, (src_h, dst_h))
 
 
 # ============================================================
@@ -245,14 +286,22 @@ class CascadedHeteroModel(BaseModel):
         stage="3",
         model_type="HGT",
     ):
-        super().__init__(node_dims, edge_dims, hidden_dim, out_dim, rel_names, stage, "mean", model_type)
+        super().__init__(node_dims, edge_dims, hidden_dim,
+                         out_dim, rel_names, stage, "mean", model_type)
         # ----------------------------------------------------
         # Backbone
         # ----------------------------------------------------
-        print("="*40,"\n\n")
+        print("="*40, "\n\n")
         print(f"Using {model_type.upper()} - Stage {self.stage}")
-        print("="*40,"\n\n")
-        if model_type == "HGT": # OK
+        print("="*40, "\n\n")
+        self.model_type = model_type
+
+        if model_type == "HGT":  # OK
+            if not self.rels:
+                raise ValueError(
+                    "model_type='HGT' requires non-empty rel_names (canonical etypes). "
+                    "Pass rel_names from the trainer/dataset so HGTConv can be initialized with num_etypes."
+                )
             # DGL's HGTConv operates on a homogeneous graph and requires explicit
             # node-type and edge-type ID tensors in forward().
             # To support heterogeneous input node feature dimensions, we project
@@ -275,6 +324,12 @@ class CascadedHeteroModel(BaseModel):
             self.layer2 = nn.ModuleDict()
             self.layer3 = nn.ModuleDict()
 
+            if not self.rels:
+                raise ValueError(
+                    "rel_names is empty. Stage 1/2 models in baseline_X require canonical etypes to build per-relation layers. "
+                    "Fix: pass rel_names from BaseTrainer.setup_model()."
+                )
+
             for rel in self.rels:
                 srctype, etype, dsttype = rel
                 src_in = node_dims[srctype]
@@ -282,53 +337,58 @@ class CascadedHeteroModel(BaseModel):
                 e_in = edge_dims[rel]
                 rel_key = "_".join(rel)
 
-                if model_type == "GCN": # OK
-                    self.layer1[rel_key] = GraphConv(
-                        (src_in, dst_in), hidden_dim)
-                    self.layer2[rel_key] = GraphConv(
-                        (hidden_dim, hidden_dim), hidden_dim)
-                    self.layer3[rel_key] = GraphConv(
-                        (hidden_dim, hidden_dim), hidden_dim)
-                elif model_type == "GraphSAGE": # OK
-                    self.layer1[rel_key] = SAGEConv(
-                        (src_in, dst_in), hidden_dim, aggregator_type='mean')
-                    self.layer2[rel_key] = SAGEConv(
-                        (hidden_dim, hidden_dim), hidden_dim, aggregator_type='mean')
-                    self.layer3[rel_key] = SAGEConv(
-                        (hidden_dim, hidden_dim), hidden_dim, aggregator_type='mean')
-                elif model_type == "GIN": # OK
+                if model_type == "GCN":  # OK
+                    # DGL GraphConv expects `in_feats` to be an int (src feature size).
+                    # For bipartite graphs, pass a feature pair (src_feat, dst_feat) to forward().
+                    # Relation subgraphs can have 0-in-degree nodes; allow them (common in heterographs).
+                    self.layer1[rel_key] = GCNWrapper(
+                        src_in, dst_in, hidden_dim)
+                    self.layer2[rel_key] = GCNWrapper(
+                        hidden_dim, hidden_dim, hidden_dim)
+                    self.layer3[rel_key] = GCNWrapper(
+                        hidden_dim, hidden_dim, hidden_dim)
+                elif model_type == "GraphSAGE":  # OK
+                    self.layer1[rel_key] = GraphSAGEWrapper(
+                        src_in, dst_in, hidden_dim)
+                    self.layer2[rel_key] = GraphSAGEWrapper(
+                        hidden_dim, hidden_dim, hidden_dim)
+                    self.layer3[rel_key] = GraphSAGEWrapper(
+                        hidden_dim, hidden_dim, hidden_dim)
+                elif model_type == "GIN":  # OK
+                    # GINConvWrapper already includes NaN guards and bipartite support.
                     self.layer1[rel_key] = GINConvWrapper(
                         src_in, dst_in, hidden_dim)
                     self.layer2[rel_key] = GINConvWrapper(
                         hidden_dim, hidden_dim, hidden_dim)
                     self.layer3[rel_key] = GINConvWrapper(
                         hidden_dim, hidden_dim, hidden_dim)
-                elif model_type == "GINE": #OK
+                elif model_type == "GINE":  # OK
                     self.layer1[rel_key] = GINEConvWrapper(
                         src_in, dst_in, e_in, hidden_dim)
                     self.layer2[rel_key] = GINEConvWrapper(
                         hidden_dim, hidden_dim, e_in, hidden_dim)
                     self.layer3[rel_key] = GINEConvWrapper(
                         hidden_dim, hidden_dim, e_in, hidden_dim)
-                elif model_type == "GatedGCN": # OK
+                elif model_type == "GatedGCN":  # OK
                     self.layer1[rel_key] = GatedGCNConvWrapper(
                         src_in, dst_in, e_in, hidden_dim)
                     self.layer2[rel_key] = GatedGCNConvWrapper(
                         hidden_dim, hidden_dim, e_in, hidden_dim)
                     self.layer3[rel_key] = GatedGCNConvWrapper(
                         hidden_dim, hidden_dim, e_in, hidden_dim)
-                elif model_type == "GATv2_no_edge": # OK
+                elif model_type == "GATv2_no_edge":  # OK
                     heads = 4
                     if hidden_dim % heads != 0:
                         raise ValueError(
                             f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})")
+                    # GATv2Conv supports bipartite graphs; allow_zero_in_degree is set for all layers.
                     self.layer1[rel_key] = GATv2Conv(
                         (src_in, dst_in), hidden_dim // heads, num_heads=heads, allow_zero_in_degree=True)
                     self.layer2[rel_key] = GATv2Conv(
                         (hidden_dim, hidden_dim), hidden_dim // heads, num_heads=heads, allow_zero_in_degree=True)
                     self.layer3[rel_key] = GATv2Conv(
                         (hidden_dim, hidden_dim), hidden_dim // heads, num_heads=heads, allow_zero_in_degree=True)
-                elif model_type == "GATv2_with_edges": # OK
+                elif model_type == "GATv2_with_edges":  # OK
                     self.layer1[rel_key] = GATv2EdgeWrapper(
                         src_in, dst_in, e_in, hidden_dim, allow_zero_in_degree=True)
                     self.layer2[rel_key] = GATv2EdgeWrapper(
@@ -337,6 +397,8 @@ class CascadedHeteroModel(BaseModel):
                         hidden_dim, hidden_dim, e_in, hidden_dim, allow_zero_in_degree=True)
                 else:
                     raise ValueError(f"Unknown model_type: {model_type}")
+
+        self.norm = nn.LayerNorm(hidden_dim)
 
         # ----------------------------------------------------
         # Heads
@@ -347,7 +409,7 @@ class CascadedHeteroModel(BaseModel):
     # --------------------------------------------------------
     # Forward
     # --------------------------------------------------------
-    
+
     def forward(self, batch):
         g = batch["graph"]
 
@@ -419,11 +481,8 @@ class CascadedHeteroModel(BaseModel):
                 g_rel = g[rel]
                 if hasattr(self.layer1[rel_key], 'proj'):
                     # Edge-aware wrappers take explicit src/dst/edge
-                    if isinstance(self.layer1[rel_key], GINConvWrapper):
-                        res = self.layer1[rel_key](g_rel, src_feat, dst_feat)
-                    else:
-                        res = self.layer1[rel_key](
-                            g_rel, src_feat, dst_feat, edge_feat)
+                    res = self.layer1[rel_key](
+                        g_rel, src_feat, dst_feat, edge_feat)
                 else:
                     # DGL convs on relation graphs must receive (feat_src, feat_dst)
                     res = self.layer1[rel_key](g_rel, (src_feat, dst_feat))
@@ -431,6 +490,8 @@ class CascadedHeteroModel(BaseModel):
                     res = res[0]
                 if res.dim() == 3:
                     res = res.flatten(1)
+                # NaN guard: replace NaNs with zero to prevent F1 collapse (applies to all model types)
+                res = torch.nan_to_num(res, nan=0.0)
                 h1[dsttype] += res
             h1 = {k: F.relu(v) for k, v in h1.items()}
 
@@ -444,12 +505,8 @@ class CascadedHeteroModel(BaseModel):
                 edge_feat = g.edges[rel].data["feat"]
                 g_rel = g[rel]
                 if hasattr(self.layer2[rel_key], 'proj'):
-                    if isinstance(self.layer2[rel_key], GINConvWrapper):
-                        res = self.layer2[rel_key](
-                            g_rel, h1[srctype], h1[dsttype])
-                    else:
-                        res = self.layer2[rel_key](
-                            g_rel, h1[srctype], h1[dsttype], edge_feat)
+                    res = self.layer2[rel_key](
+                        g_rel, h1[srctype], h1[dsttype], edge_feat)
                 else:
                     res = self.layer2[rel_key](
                         g_rel, (h1[srctype], h1[dsttype]))
@@ -457,6 +514,7 @@ class CascadedHeteroModel(BaseModel):
                     res = res[0]
                 if res.dim() == 3:
                     res = res.flatten(1)
+                res = torch.nan_to_num(res, nan=0.0)
                 h2[dsttype] += res
             h2 = {k: F.relu(v) for k, v in h2.items()}
 
@@ -470,12 +528,8 @@ class CascadedHeteroModel(BaseModel):
                 edge_feat = g.edges[rel].data["feat"]
                 g_rel = g[rel]
                 if hasattr(self.layer3[rel_key], 'proj'):
-                    if isinstance(self.layer3[rel_key], GINConvWrapper):
-                        res = self.layer3[rel_key](
-                            g_rel, h2[srctype], h2[dsttype])
-                    else:
-                        res = self.layer3[rel_key](
-                            g_rel, h2[srctype], h2[dsttype], edge_feat)
+                    res = self.layer3[rel_key](
+                        g_rel, h2[srctype], h2[dsttype], edge_feat)
                 else:
                     res = self.layer3[rel_key](
                         g_rel, (h2[srctype], h2[dsttype]))
@@ -483,11 +537,13 @@ class CascadedHeteroModel(BaseModel):
                     res = res[0]
                 if res.dim() == 3:
                     res = res.flatten(1)
+                res = torch.nan_to_num(res, nan=0.0)
                 h3[dsttype] += res
             h3 = {k: F.relu(v) for k, v in h3.items()}
             h = h3
             # Residual from Layer 1 to Layer 3
-            # h = {k: v + h1[k] for k, v in h3.items()}
+            h = {k: v + h1[k] for k, v in h3.items()}
+            h = {k: torch.nan_to_num(v, nan=0.0) for k, v in h.items()}
 
         self.h = h
         return super().forward(batch)

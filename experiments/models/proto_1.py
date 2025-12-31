@@ -302,7 +302,7 @@ class CascadedHeteroModel(BaseModel):
         stage="3",
     ):
         super().__init__(node_dims, edge_dims, hidden_dim, out_dim, rel_names, stage)
-
+        self.model_type = "HGINA_RGCN_Cascade"
         print("="*40,"\n\n")
         print(f"Using HGINA + RGCN - Stage {self.stage}")
         print("="*40,"\n\n")

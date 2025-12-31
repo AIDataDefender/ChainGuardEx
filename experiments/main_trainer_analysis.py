@@ -2,6 +2,7 @@ import os
 import time
 import traceback
 import argparse
+import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, recall_score, roc_curve, auc
@@ -9,10 +10,13 @@ import numpy as np
 from sklearn.metrics import f1_score, precision_score, roc_auc_score
 from base_trainer import BaseTrainer
 import torch
+import dgl
+from torchinfo import summary  # type: ignore
 try:
     from experiments.the_utils.graph_utils import OWASP_VULN
 except ImportError:
     from the_utils.graph_utils import OWASP_VULN
+
 
 class TrainerWithAnalysis(BaseTrainer):
     """
@@ -20,9 +24,9 @@ class TrainerWithAnalysis(BaseTrainer):
     Stage (Graph vs Node Classification).
     """
 
-    def __init__(self, do_test_data=True, use_torch_compile=None, use_profiler=None, **kwargs):
+    def __init__(self, do_test_data=True, **kwargs):
         self.do_test_data = do_test_data
-        super().__init__(use_torch_compile=use_torch_compile, use_profiler=use_profiler, **kwargs)
+        super().__init__(**kwargs)
 
         # Store training start time for efficiency tracking
         self.start_time = time.time()
@@ -151,20 +155,46 @@ class TrainerWithAnalysis(BaseTrainer):
                 self.logger.info(
                     f"  Vulnerable {entity}: {pos_samples} ({pos_pct:.2f}%)")
                 if self.stage == 3 and class_counts is not None:
-                    self.logger.info(f"  Per-Class Positive Counts: {class_counts.numpy()}")
-                    self.logger.info(f"  Class Imbalance Ratios: {(class_counts / class_counts.sum()).numpy()}")
+                    self.logger.info(
+                        f"  Per-Class Positive Counts: {class_counts.numpy()}")
+                    self.logger.info(
+                        f"  Class Imbalance Ratios: {(class_counts / class_counts.sum()).numpy()}")
 
         except Exception as e:
             self.logger.error(f"Analysis failed: {e}")
             traceback.print_exc()
 
     def _log_model_summary(self):
-        """Log model parameters."""
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel()
-                                for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(
-            f"Model Summary: {total_params:,} Total Params ({trainable_params:,} Trainable)")
+        """Generate and log model summary."""
+        try:
+
+            self.logger.info("Generating model summary...")
+
+            summary_batch = next(iter(self.val_loader))
+
+            # Move the sample batch to the device
+            batch_gpu = {}
+            for key, tensor in summary_batch.items():
+                if isinstance(tensor, torch.Tensor):
+                    batch_gpu[key] = tensor.to(self.device)
+                elif isinstance(tensor, dgl.DGLGraph):
+                    batch_gpu[key] = tensor.to(self.device)
+
+            self.logger.info("" + "=" * 40)
+            self.logger.info("--- Model Summary ---")
+
+            # Generate the summary by passing the sample batch as input_data
+            summary(self.model,
+                    input_data=batch_gpu,
+                    depth=8,
+                    col_names=["input_size", "output_size", "num_params", "mult_adds"])
+
+            self.logger.info("=" * 40 + "\n")
+
+        except Exception as e:
+            self.logger.warning(f"Could not generate model summary: {e}")
+            self.logger.info(
+                f"Model Architecture (simple):\n{self.model}")  # Fallback
 
     def save_history_plot(self):
         """Save training history plot."""
@@ -205,7 +235,6 @@ class TrainerWithAnalysis(BaseTrainer):
     def visualize_results(self, test_metrics=None):
         """Generate Stage-specific visualizations."""
         try:
-            sns.set_theme(style="whitegrid")
             os.makedirs(f"{self.log_folder}/viz", exist_ok=True)
 
             # 1. Training History
@@ -214,40 +243,55 @@ class TrainerWithAnalysis(BaseTrainer):
                 y_true = test_metrics["y_true"]
                 y_pred = test_metrics["y_pred"]
 
-                # Flatten Multi-label to Binary (Vuln vs Benign) for visualization
+            if self.stage == 3:
+                # Multilabel Confusion Matrix
+                num_classes = y_true.shape[1]
+                fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+                axes = axes.flatten()
+                for c in range(num_classes):
+                    cm = confusion_matrix(
+                        y_true[:, c], y_pred[:, c], labels=[0, 1])
+                    disp = ConfusionMatrixDisplay(
+                        cm, display_labels=["Safe", "Vuln"])
+                    disp.plot(cmap="Blues", ax=axes[c], colorbar=False)
+                    axes[c].set_title(f'{OWASP_VULN[c]} Confusion Matrix')
+                plt.tight_layout()
+                plt.savefig(f"{self.log_folder}/viz/cm_stage{self.stage}.png")
+                plt.close()
+            else:
+                # Binary Confusion Matrix
                 if y_true.ndim > 1:
-                    y_true = (y_true.sum(axis=1) > 0).astype(int)
-                    y_pred = (y_pred.sum(axis=1) > 0).astype(int)
-
-                cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+                    y_true_flat = (y_true.sum(axis=1) > 0).astype(int)
+                    y_pred_flat = (y_pred.sum(axis=1) > 0).astype(int)
+                else:
+                    y_true_flat = y_true
+                    y_pred_flat = y_pred
+                cm = confusion_matrix(y_true_flat, y_pred_flat, labels=[0, 1])
                 disp = ConfusionMatrixDisplay(
-                    confusion_matrix=cm, display_labels=["Safe", "Vuln"])
-
+                    cm, display_labels=["Safe", "Vuln"])
                 fig, ax = plt.subplots(figsize=(6, 6))
                 disp.plot(cmap="Blues", ax=ax, colorbar=False)
                 plt.title(f"Stage {self.stage} Confusion Matrix")
                 plt.savefig(f"{self.log_folder}/viz/cm_stage{self.stage}.png")
                 plt.close()
-
-            # 3. Per-Class Metrics (for Stage 3)
-            if self.stage == 3 and test_metrics and "y_pred" in test_metrics and "y_true" in test_metrics:
-                y_true = test_metrics["y_true"]
                 y_pred = test_metrics["y_pred"]
                 num_classes = y_true.shape[1]
-                
+
                 f1_per_class = []
                 prec_per_class = []
                 rec_per_class = []
                 auc_per_class = []
-                
+
                 for c in range(num_classes):
                     f1 = f1_score(y_true[:, c], y_pred[:, c], zero_division=0)
-                    prec = precision_score(y_true[:, c], y_pred[:, c], zero_division=0)
-                    rec = recall_score(y_true[:, c], y_pred[:, c], zero_division=0)
+                    prec = precision_score(
+                        y_true[:, c], y_pred[:, c], zero_division=0)
+                    rec = recall_score(
+                        y_true[:, c], y_pred[:, c], zero_division=0)
                     f1_per_class.append(f1)
                     prec_per_class.append(prec)
                     rec_per_class.append(rec)
-                    
+
                     # AUC if available
                     if "y_prob" in test_metrics:
                         y_prob = test_metrics["y_prob"]
@@ -258,43 +302,98 @@ class TrainerWithAnalysis(BaseTrainer):
                             auc_per_class.append(0.5)
                     else:
                         auc_per_class.append(0.5)
-                
+
                 # Plot
                 x = np.arange(num_classes)
                 width = 0.2
                 fig, ax = plt.subplots(figsize=(12, 6))
-                ax.bar(x - width, f1_per_class, width, label='F1', color='blue')
-                ax.bar(x, prec_per_class, width, label='Precision', color='green')
-                ax.bar(x + width, rec_per_class, width, label='Recall', color='red')
+                ax.bar(x - width, f1_per_class, width,
+                       label='F1', color='blue')
+                ax.bar(x, prec_per_class, width,
+                       label='Precision', color='green')
+                ax.bar(x + width, rec_per_class, width,
+                       label='Recall', color='red')
                 ax.set_xlabel('Vulnerability Class')
                 ax.set_ylabel('Score')
                 ax.set_title(f'Stage {self.stage} Per-Class Metrics')
                 ax.set_xticks(x)
                 ax.set_xticklabels([OWASP_VULN[c] for c in range(num_classes)])
                 ax.legend()
-                plt.savefig(f"{self.log_folder}/viz/per_class_metrics_stage{self.stage}.png")
+                plt.savefig(
+                    f"{self.log_folder}/viz/per_class_metrics_stage{self.stage}.png")
                 plt.close()
 
-            # 4. Per-Class Confusion Matrices (for Stage 3)
-            if self.stage == 3 and test_metrics and "y_pred" in test_metrics and "y_true" in test_metrics:
-                y_true = test_metrics["y_true"]
-                y_pred = test_metrics["y_pred"]
-                num_classes = y_true.shape[1]
-                
-                # Create a figure with subplots for each class
-                fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-                axes = axes.flatten()
-                
-                for c in range(num_classes):
-                    cm = confusion_matrix(y_true[:, c], y_pred[:, c], labels=[0, 1])
-                    disp = ConfusionMatrixDisplay(
-                        confusion_matrix=cm, display_labels=["Safe", "Vuln"])
-                    disp.plot(cmap="Blues", ax=axes[c], colorbar=False)
-                    axes[c].set_title(f'{OWASP_VULN[c]} Confusion Matrix')
-                
-                plt.tight_layout()
-                plt.savefig(f"{self.log_folder}/viz/per_class_cm_stage{self.stage}.png")
-                plt.close()
+            # Save confusion matrix statistics
+            if test_metrics and "y_pred" in test_metrics and "y_true" in test_metrics:
+                cm_stats = {"stage": self.stage}
+                y_true_orig = test_metrics["y_true"]
+                y_pred_orig = test_metrics["y_pred"]
+
+                if self.stage == 3:
+                    # Per class
+                    num_classes = y_true_orig.shape[1]
+                    cm_matrices = []
+                    f1_per_class = []
+                    prec_per_class = []
+                    rec_per_class = []
+                    auc_per_class = []
+
+                    for c in range(num_classes):
+                        cm = confusion_matrix(
+                            y_true_orig[:, c], y_pred_orig[:, c], labels=[0, 1])
+                        cm_matrices.append(cm.tolist())
+                        tn, fp, fn, tp = cm.ravel()
+                        prec = tp / (tp + fp) if tp + fp > 0 else 0
+                        rec = tp / (tp + fn) if tp + fn > 0 else 0
+                        f1 = 2 * tp / (2 * tp + fp + fn) if 2 * \
+                            tp + fp + fn > 0 else 0
+                        f1_per_class.append(f1)
+                        prec_per_class.append(prec)
+                        rec_per_class.append(rec)
+
+                        if "y_prob" in test_metrics:
+                            y_prob = test_metrics["y_prob"]
+                            if len(np.unique(y_true_orig[:, c])) == 2:
+                                auc_val = roc_auc_score(
+                                    y_true_orig[:, c], y_prob[:, c])
+                            else:
+                                auc_val = 0.5
+                        else:
+                            auc_val = 0.5
+                        auc_per_class.append(auc_val)
+
+                    cm_stats["per_class"] = {
+                        "f1": f1_per_class,
+                        "precision": prec_per_class,
+                        "recall": rec_per_class,
+                        "auc": auc_per_class,
+                        "cm_matrices": cm_matrices
+                    }
+
+                # Overall binary cm
+                if self.stage == 3:
+                    y_true_flat = (y_true_orig.sum(axis=1) > 0).astype(int)
+                    y_pred_flat = (y_pred_orig.sum(axis=1) > 0).astype(int)
+                else:
+                    y_true_flat = y_true_orig
+                    y_pred_flat = y_pred_orig
+
+                cm = confusion_matrix(y_true_flat, y_pred_flat, labels=[0, 1])
+                tn, fp, fn, tp = cm.ravel()
+                cm_stats["overall"] = {
+                    "tp": int(tp),
+                    "fp": int(fp),
+                    "tn": int(tn),
+                    "fn": int(fn),
+                    "accuracy": float((tp + tn) / (tp + tn + fp + fn)) if tp + tn + fp + fn > 0 else 0,
+                    "precision": float(tp / (tp + fp)) if tp + fp > 0 else 0,
+                    "recall": float(tp / (tp + fn)) if tp + fn > 0 else 0,
+                    "f1": float(2 * tp / (2 * tp + fp + fn)) if 2 * tp + fp + fn > 0 else 0,
+                    "cm_matrix": cm.tolist()
+                }
+
+                with open(f"{self.log_folder}/viz/cm_stats_stage{self.stage}.json", 'w') as f:
+                    json.dump(cm_stats, f, indent=4)
 
             # 5. ROC AUC Curves
             if test_metrics and "y_prob" in test_metrics and "y_true" in test_metrics:
@@ -306,15 +405,18 @@ class TrainerWithAnalysis(BaseTrainer):
                     fpr, tpr, _ = roc_curve(y_true, y_prob)
                     roc_auc = auc(fpr, tpr)
                     plt.figure(figsize=(8, 6))
-                    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
-                    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                    plt.plot(fpr, tpr, color='darkorange', lw=2,
+                             label=f'ROC curve (area = {roc_auc:.2f})')
+                    plt.plot([0, 1], [0, 1], color='navy',
+                             lw=2, linestyle='--')
                     plt.xlim([0.0, 1.0])
                     plt.ylim([0.0, 1.05])
                     plt.xlabel('False Positive Rate')
                     plt.ylabel('True Positive Rate')
                     plt.title(f'Stage {self.stage} ROC Curve')
                     plt.legend(loc="lower right")
-                    plt.savefig(f"{self.log_folder}/viz/roc_stage{self.stage}.png")
+                    plt.savefig(
+                        f"{self.log_folder}/viz/roc_stage{self.stage}.png")
                     plt.close()
 
                 elif self.stage == 3:
@@ -325,7 +427,8 @@ class TrainerWithAnalysis(BaseTrainer):
                         if len(np.unique(y_true[:, c])) == 2:
                             fpr, tpr, _ = roc_curve(y_true[:, c], y_prob[:, c])
                             roc_auc = auc(fpr, tpr)
-                            ax.plot(fpr, tpr, lw=2, label=f'{OWASP_VULN[c]} (AUC = {roc_auc:.2f})')
+                            ax.plot(
+                                fpr, tpr, lw=2, label=f'{OWASP_VULN[c]} (AUC = {roc_auc:.2f})')
                     ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
                     ax.set_xlim([0.0, 1.0])
                     ax.set_ylim([0.0, 1.05])
@@ -333,7 +436,8 @@ class TrainerWithAnalysis(BaseTrainer):
                     ax.set_ylabel('True Positive Rate')
                     ax.set_title(f'Stage {self.stage} ROC Curves per Class')
                     ax.legend(loc="lower right")
-                    plt.savefig(f"{self.log_folder}/viz/roc_per_class_stage{self.stage}.png")
+                    plt.savefig(
+                        f"{self.log_folder}/viz/roc_per_class_stage{self.stage}.png")
                     plt.close()
         except Exception as e:
             self.logger.error(f"Visualization failed: {e}")
@@ -359,8 +463,9 @@ class CascadeOrchestrator:
         self.results = {}
         self.stages = stage if stage is not None else [1, 2, 3]
         self.run_all_models = bool(run_all_models)
-        self.model_types = list(model_types) if model_types is not None else None
-        self.batch_size = batch_size # Use default batch sizes per stage in base_trainer
+        self.model_types = list(
+            model_types) if model_types is not None else None
+        self.batch_size = batch_size  # Use default batch sizes per stage in base_trainer
         self.epochs = epochs  # Use default epochs per stage in base_trainer
 
     def run(self):
@@ -376,7 +481,8 @@ class CascadeOrchestrator:
                 from models.baseline_X import SUPPORTED_MODEL_TYPES
             model_types = list(SUPPORTED_MODEL_TYPES)
         else:
-            model_types = self.model_types if self.model_types is not None else [None]
+            model_types = self.model_types if self.model_types is not None else [
+                None]
 
         for stage in self.stages:
             print(f"\n{'='*40}")
@@ -393,16 +499,10 @@ class CascadeOrchestrator:
                     trainer = TrainerWithAnalysis(
                         stage=stage,
                         batch_size=self.batch_size,
-                        num_epochs=self.epochs,  
+                        num_epochs=self.epochs,
                         do_test_data=False,
                         model_type=model_type,
                     )
-
-                    # Print model summary
-                    print("Model Summary:")
-                    total_params = sum(p.numel() for p in trainer.model.parameters())
-                    trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-                    print(f"Total Params: {total_params:,}, Trainable: {trainable_params:,}")
 
                     # 2. Train
                     trainer.train()
@@ -444,7 +544,8 @@ class CascadeOrchestrator:
 
         for stage in self.stages:
             # Print in a stable order: stage, then model name.
-            stage_rows = [(k, v) for k, v in self.results.items() if k[0] == stage]
+            stage_rows = [(k, v)
+                          for k, v in self.results.items() if k[0] == stage]
             stage_rows.sort(key=lambda kv: kv[0][1])
             if not stage_rows:
                 continue
@@ -464,7 +565,8 @@ class CascadeOrchestrator:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ChainGuard training + analysis runner")
+    parser = argparse.ArgumentParser(
+        description="ChainGuard training + analysis runner")
     parser.add_argument(
         "--run-all-models",
         action="store_true",
