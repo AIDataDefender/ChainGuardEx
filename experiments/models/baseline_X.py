@@ -19,9 +19,9 @@ from dgl.nn.pytorch import (
 
 SUPPORTED_MODEL_TYPES = (
     # "HGT",
-    "GCN",
-    "GraphSAGE",
-    "GIN",
+    # "GCN",
+    # "GraphSAGE",
+    # "GIN",
     # "GINE",
     # "GatedGCN",
     "GATv2_no_edge",

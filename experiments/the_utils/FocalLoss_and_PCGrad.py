@@ -152,7 +152,7 @@ class FocalLoss(nn.Module):
         Returns:
             torch.Tensor: Focal Loss (unreduced if reduction='none')
         """
-        # Ensure targets are float
+        inputs = inputs.float()
         targets = targets.float()
 
         # Get probabilities (0-1 range)

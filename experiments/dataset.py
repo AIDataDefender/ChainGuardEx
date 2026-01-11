@@ -43,7 +43,7 @@ def _print_path_banner(title: str, rows):
         header = f"{deco} {title} {deco}"
         print("\n" + header)
         for k, v in rows:
-            print(f"  ▸ {k}: {v}")
+            print(f"  > {k}: {v}")
         print("═" * len(header) + "\n")
     except Exception:
         # Never let debug printing break training runs.
@@ -69,6 +69,7 @@ def standardize_heterograph(
     embedding_dims,
     *,
     filter_out_node_types=None,
+    zero_out_node_types=None,
     filter_out_edge_types=None,
     drop_non_schema_match=False,
     report=False,
@@ -85,6 +86,10 @@ def standardize_heterograph(
     Options:
     - filter_out_node_types: list[str]; remove these node types entirely.
       Edges whose src/dst node types are removed are also removed.
+        - zero_out_node_types: list[str]; keep node types in the schema, but set their
+            node counts to 0 and remove all incident edges. This is recommended for
+            ablations because current model heads assume both cfg_node and ast_node
+            exist in the heterograph schema.
     - filter_out_edge_types: list[canonical_etype]; remove these canonical etypes.
       Accepts tuples like (src, etype, dst); elements are stringified.
     - drop_non_schema_match: if True AND no explicit filtering is enabled,
@@ -120,12 +125,17 @@ def standardize_heterograph(
         for x in (filter_out_node_types or [])
         if _to_ntype(x)
     )
+    zero_out_node_types = set(
+        _to_ntype(x)
+        for x in (zero_out_node_types or [])
+        if _to_ntype(x)
+    )
     filter_out_edge_types = set(
         r
         for r in (_to_rel(x) for x in (filter_out_edge_types or []))
         if r
     )
-    filtering_enabled = bool(filter_out_node_types or filter_out_edge_types)
+    filtering_enabled = bool(filter_out_node_types or filter_out_edge_types or zero_out_node_types)
 
     try:
         req_rels = [r for r in (_to_rel(x)
@@ -181,6 +191,11 @@ def standardize_heterograph(
     num_nodes_dict = {nt: int(g.num_nodes(
         nt)) if nt in g.ntypes else 0 for nt in sorted(required_ntypes)}
 
+    # Node-type ablation: keep ntype but drop its nodes.
+    for nt in list(zero_out_node_types):
+        if nt in num_nodes_dict:
+            num_nodes_dict[nt] = 0
+
     # Build edge data mapping for heterograph creation
     data_dict = {}
     existing = set(getattr(g, "canonical_etypes", []))
@@ -196,7 +211,11 @@ def standardize_heterograph(
             continue
         if s not in num_nodes_dict or d not in num_nodes_dict:
             continue
-        if rel in existing_str:
+        # If either endpoint type is ablated to 0 nodes, force-empty the edge set.
+        if int(num_nodes_dict.get(s, 0)) == 0 or int(num_nodes_dict.get(d, 0)) == 0:
+            src = torch.empty((0,), dtype=torch.int64)
+            dst = torch.empty((0,), dtype=torch.int64)
+        elif rel in existing_str:
             try:
                 src, dst = g.edges(etype=rel)
             except Exception:
@@ -274,6 +293,7 @@ def standardize_heterograph(
                 feat = g.nodes[ntype].data.get("feat")
             except Exception:
                 feat = None
+
         if isinstance(feat, torch.Tensor) and feat.shape[0] == n:
             new_g.nodes[ntype].data["feat"] = feat.to(torch.float32)
         else:
@@ -285,12 +305,13 @@ def standardize_heterograph(
 
             if dim > 0:
                 mean_vec = None
-                if fill_strategy == "mean" and isinstance(feat, torch.Tensor) and feat.dim() == 2 and feat.shape[1] == dim and feat.numel() > 0:
+                chosen = fill_strategy
+                if chosen == "mean" and isinstance(feat, torch.Tensor) and feat.dim() == 2 and feat.shape[1] == dim and feat.numel() > 0:
                     mean_vec = feat.to(torch.float32).mean(dim=0)
                 new_g.nodes[ntype].data["feat"] = _make_fill(
                     (n, dim),
                     key=f"node:{ntype}:{dim}",
-                    strategy=fill_strategy,
+                    strategy=chosen,
                     mean_vec=mean_vec,
                 )
 
@@ -376,6 +397,10 @@ class CustomDataset(Dataset):
         stage=3,
         is_test=False,
         embedding_model_conf=PretrainConfig.CodeBERT,
+        ablate_node_type=None,
+        drop_cross_edges=False,
+        keep_relation_types=None,
+        drop_relation_types=None,
         # embedding_model_name="intfloat/e5-base-v2",
 
     ):
@@ -397,6 +422,36 @@ class CustomDataset(Dataset):
         self.dataset_embedding = {}
         self.is_test = is_test
         self.temp_files = []
+
+        # Ablation: keep schema but set one node type to 0 nodes (and incident edges to 0).
+        self.zero_out_node_types = []
+        try:
+            v = (ablate_node_type or "").strip().lower()
+            if v in ("cfg", "cfg_node", "no_cfg", "drop_cfg"):
+                self.zero_out_node_types = ["cfg_node"]
+            elif v in ("ast", "ast_node", "no_ast", "drop_ast"):
+                self.zero_out_node_types = ["ast_node"]
+        except Exception:
+            self.zero_out_node_types = []
+
+        # Ablation: drop only AST<->CFG cross edges (e.g., ast_to_cfg)
+        self.drop_cross_edges = bool(drop_cross_edges)
+
+        # Relation pruning by etype name (the middle element in canonical etype tuples).
+        def _parse_rel_list(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple, set)):
+                out = [str(x).strip() for x in v if str(x).strip()]
+                return out or None
+            s = str(v).strip()
+            if not s:
+                return None
+            out = [x.strip() for x in s.split(",") if x.strip()]
+            return out or None
+
+        self.keep_relation_types = _parse_rel_list(keep_relation_types)
+        self.drop_relation_types = _parse_rel_list(drop_relation_types)
 
         # Initialize Processor components only if needed (Force Reload or Missing Data)
         # We check simple existence first to avoid loading heavy models unnecessarily
@@ -422,6 +477,10 @@ class CustomDataset(Dataset):
                 ("stage", stage),
                 ("is_test", self.is_test),
                 ("embedding", self.embedding_model__name_id),
+                ("ablate_node_type", ",".join(self.zero_out_node_types) if self.zero_out_node_types else "<none>"),
+                ("drop_cross_edges", self.drop_cross_edges),
+                ("keep_relation_types", ",".join(self.keep_relation_types) if self.keep_relation_types else "<none>"),
+                ("drop_relation_types", ",".join(self.drop_relation_types) if self.drop_relation_types else "<none>"),
                 ("load_dir", os.path.abspath(self.load_dir)),
                 ("save_dir (shards)", os.path.abspath(self.save_dir)),
                 ("base_filename", self.base_filename),
@@ -1270,6 +1329,33 @@ class CustomDataset(Dataset):
                 for subkey, graph_data in graphs_data.items():
                     full_key = f"{p_name_g}@{subkey}"
 
+                    # Compute required relations after applying ablations/pruning.
+                    required_rels = getattr(self.CPG_Proccessor, "rel_names", None)
+                    try:
+                        req = []
+                        for r in (required_rels or []):
+                            rr = _rel_to_str_tuple(r)
+                            if not (isinstance(rr, tuple) and len(rr) == 3):
+                                continue
+                            s, e, d = rr
+
+                            # Drop AST<->CFG cross edges only (e.g., ast_to_cfg)
+                            if self.drop_cross_edges:
+                                if {str(s), str(d)} == {"ast_node", "cfg_node"} and str(s) != str(d):
+                                    continue
+
+                            # Relation pruning by etype name
+                            if self.keep_relation_types is not None:
+                                if str(e) not in set(self.keep_relation_types):
+                                    continue
+                            if self.drop_relation_types is not None:
+                                if str(e) in set(self.drop_relation_types):
+                                    continue
+
+                            req.append((str(s), str(e), str(d)))
+                    except Exception:
+                        req = required_rels
+
                     lbl = labels_data.get(subkey)
                     if lbl is None:
                         raise ValueError(
@@ -1325,9 +1411,9 @@ class CustomDataset(Dataset):
                         try:
                             g = standardize_heterograph(
                                 g,
-                                getattr(self.CPG_Proccessor,
-                                        "rel_names", None),
+                                req,
                                 self.embedding_dims,
+                                zero_out_node_types=self.zero_out_node_types,
                             )
                         except Exception as e:
                             logger.warning(
@@ -1357,11 +1443,21 @@ class CustomDataset(Dataset):
                         elif ast_tensor.dim() == 1 and ast_tensor.numel() == expected_dim:
                             ast_tensor = ast_tensor.unsqueeze(0)
 
+                        # Apply node-type ablation to labels (must match the ablated graph).
+                        zeroed = set(self.zero_out_node_types or [])
+                        if "cfg_node" in zeroed:
+                            cfg_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+                        if "ast_node" in zeroed:
+                            ast_tensor = torch.zeros(
+                                (0, expected_dim), dtype=torch.float32)
+
                     if self.stage in [1, 2]:
                         g = standardize_heterograph(
                             g,
-                            getattr(self.CPG_Proccessor, "rel_names", None),
+                            req,
                             self.embedding_dims,
+                            zero_out_node_types=self.zero_out_node_types,
                         )
 
                     dataset_graph_temp.append((full_key, g))
@@ -1392,6 +1488,21 @@ class CustomDataset(Dataset):
             logger.warning(
                 f"Postprocessing mismatch: graphs={len(dataset_graph_temp)} labels={len(dataset_label_temp)}"
             )
+
+        # Refresh rel_names from the standardized graphs (important for ablations/pruning).
+        try:
+            rels = set()
+            for _k, _g in dataset_graph_temp:
+                if hasattr(_g, "canonical_etypes"):
+                    rels.update(list(_g.canonical_etypes))
+            self.rel_names = list(rels)
+            if hasattr(self, "CPG_Proccessor") and self.CPG_Proccessor is not None:
+                try:
+                    self.CPG_Proccessor.rel_names = list(rels)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         self.dataset_graph = dataset_graph_temp
         self.dataset_label = dataset_label_temp
@@ -1516,6 +1627,30 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, processes only a small test subset of the data.",
     )
+    parser.add_argument(
+        "--ablate-node-type",
+        type=str,
+        default="none",
+        choices=["none", "cfg", "ast"],
+        help="Ablation: set a node type to 0 nodes (and drop incident edges) while keeping schema.",
+    )
+    parser.add_argument(
+        "--drop-cross-edges",
+        action="store_true",
+        help="Ablation: drop only AST<->CFG cross edges (e.g., ast_to_cfg).",
+    )
+    parser.add_argument(
+        "--keep-relations",
+        type=str,
+        default="",
+        help="Relation-type pruning: comma-separated etype names to KEEP (e.g., cf,df,call).",
+    )
+    parser.add_argument(
+        "--drop-relations",
+        type=str,
+        default="",
+        help="Relation-type pruning: comma-separated etype names to DROP.",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -1526,4 +1661,8 @@ if __name__ == "__main__":
 
     # One processing pass generates and saves all 3 stages.
     _ = CustomDataset(source=args.source,
-                      stage=3, force_reload=args.force_reload, is_test=args.test)
+                        stage=3, force_reload=args.force_reload, is_test=args.test,
+                        ablate_node_type=(None if args.ablate_node_type == "none" else args.ablate_node_type),
+                        drop_cross_edges=args.drop_cross_edges,
+                        keep_relation_types=(args.keep_relations or None),
+                        drop_relation_types=(args.drop_relations or None))

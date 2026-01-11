@@ -45,7 +45,7 @@ class HGINAConv(nn.Module):
         hidden_dim = mlp_hidden_multiplier * out_feats
         self.mlp = nn.Sequential(
             nn.Linear(out_feats, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_feats),
         )
@@ -201,15 +201,66 @@ class HeteroRGCNLayer(nn.Module):
 
         # Relation-specific projection: src -> out_dim
         self.weight = nn.ModuleDict(
-            {"_".join(rel): nn.Linear(in_dim, out_dim, bias=False) for rel in rel_names}
+            {"_".join(rel): nn.Linear(in_dim, out_dim, bias=False)
+            for rel in rel_names}
         )
 
-        # Per-node-type self loop projection
+        # GIN-style epsilon on the self term
+        self.eps = nn.Parameter(torch.tensor(float(eps_init)))
+
+        # Per-node-type self loop and residual projection
         if self.ntypes is None:
             self.self_loop = nn.Linear(in_dim, out_dim, bias=True)
+            self.res_proj = (
+                nn.Identity()
+                if in_dim == out_dim
+                else nn.Linear(in_dim, out_dim, bias=False)
+            )
         else:
             self.self_loop = nn.ModuleDict(
-                {nt: nn.Linear(in_dim, out_dim, bias=True) for nt in self.ntypes}
+                {nt: nn.Linear(in_dim, out_dim, bias=True)
+                for nt in self.ntypes}
+            )
+            self.res_proj = nn.ModuleDict(
+                {
+                    nt: (nn.Identity() if in_dim == out_dim else nn.Linear(
+                        in_dim, out_dim, bias=False))
+                    for nt in self.ntypes
+                }
+            )
+
+        # Per-dst-type relation mixing (softmax over incoming relations)
+        # Logit = Linear(tanh([h_self || neigh_rel]))
+        if self.ntypes is None:
+            self.rel_attn = nn.Linear(2 * out_dim, 1, bias=False)
+        else:
+            self.rel_attn = nn.ModuleDict(
+                {nt: nn.Linear(2 * out_dim, 1, bias=False)
+                    for nt in self.ntypes}
+            )
+
+        hidden_dim = 2 * out_dim
+        if self.ntypes is None:
+            self.norm = nn.LayerNorm(out_dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(out_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, out_dim),
+            )
+        else:
+            self.norm = nn.ModuleDict(
+                {nt: nn.LayerNorm(out_dim) for nt in self.ntypes})
+            self.ffn = nn.ModuleDict(
+                {
+                    nt: nn.Sequential(
+                        nn.Linear(out_dim, hidden_dim),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_dim, out_dim),
+                    )
+                    for nt in self.ntypes
+                }
             )
 
         self.feat_drop = nn.Dropout(dropout)
@@ -241,7 +292,7 @@ class HeteroRGCNLayer(nn.Module):
                 rel_g.update_all(fn.copy_u("Wh", "m"), fn.sum("m", "neigh"))
                 neigh_by_rel[rel_key] = rel_g.dstdata["neigh"]
 
-            # 2) Sum incoming relation messages per destination node type
+            # 2) Mix relations per destination node type with a softmax attention
             h_out = {}
             for ntype in g.ntypes:
                 num_nodes = g.num_nodes(ntype)
@@ -255,21 +306,66 @@ class HeteroRGCNLayer(nn.Module):
 
                 if self.ntypes is None:
                     h_self = self.self_loop(self.feat_drop(h_dict[ntype]))
+                    res = self.res_proj(h_dict[ntype])
+                    norm = self.norm
+                    ffn = self.ffn
+                    rel_attn = self.rel_attn
                 else:
-                    h_self = self.self_loop[ntype](self.feat_drop(h_dict[ntype]))
+                    h_self = self.self_loop[ntype](
+                        self.feat_drop(h_dict[ntype]))
+                    res = self.res_proj[ntype](h_dict[ntype])
+                    norm = self.norm[ntype]
+                    ffn = self.ffn[ntype]
+                    rel_attn = self.rel_attn[ntype]
 
-                neigh_sum = torch.zeros_like(h_self)
-                for rel in self.rel_names:
-                    if rel[2] != ntype:
-                        continue
-                    rel_key = "_".join(rel)
-                    if rel_key in neigh_by_rel:
-                        neigh_sum = neigh_sum + neigh_by_rel[rel_key]
+                # Collect incoming relation messages for this destination type
+                in_rels = [rel for rel in self.rel_names if rel[2] == ntype]
+                if len(in_rels) == 0:
+                    neigh_mix = torch.zeros_like(h_self)
+                else:
+                    msg_list = []
+                    present_mask = []
+                    for rel in in_rels:
+                        rel_key = "_".join(rel)
+                        if rel_key in neigh_by_rel:
+                            msg_list.append(neigh_by_rel[rel_key])
+                            present_mask.append(True)
+                        else:
+                            msg_list.append(
+                                torch.zeros(
+                                    num_nodes,
+                                    self.out_dim,
+                                    device=h_self.device,
+                                    dtype=h_self.dtype,
+                                )
+                            )
+                            present_mask.append(False)
 
-                # 3) Pure RGCN update: self-loop + summed relation messages
-                x = h_self + neigh_sum
-                x = F.relu(x)
-                h_out[ntype] = self.dropout(x)
+                    msg_stack = torch.stack(msg_list, dim=1)  # [N, R, D]
+                    h_rep = h_self.unsqueeze(
+                        1).expand(-1, msg_stack.shape[1], -1)
+                    attn_in = torch.cat(
+                        [h_rep, msg_stack], dim=-1)  # [N, R, 2D]
+                    logits = rel_attn(torch.tanh(attn_in)).squeeze(-1)  # [N, R]
+
+                    if not all(present_mask):
+                        mask_t = torch.tensor(
+                            present_mask,
+                            device=logits.device,
+                            dtype=torch.bool,
+                        ).unsqueeze(0)
+                        logits = logits.masked_fill(~mask_t, float("-inf"))
+
+                    alpha = F.softmax(logits, dim=1)
+                    alpha = torch.nan_to_num(alpha, nan=0.0)
+                    neigh_mix = (alpha.unsqueeze(-1) * msg_stack).sum(dim=1)
+
+                # 3) GIN-style update + FFN + residual
+                x = (1 + self.eps) * h_self + neigh_mix
+                x = norm(x)
+                x = x + ffn(x)
+                x = x + res
+                h_out[ntype] = self.dropout(F.gelu(x))
 
             return h_out
 
@@ -292,12 +388,14 @@ class HeteroRGCN(nn.Module):
 
         self.layers = nn.ModuleList()
         self.layers.append(
-            HeteroRGCNLayer(in_dim, hidden_dim, rel_names, ntypes=ntypes, dropout=dropout)
+            HeteroRGCNLayer(in_dim, hidden_dim, rel_names,
+                            ntypes=ntypes, dropout=dropout)
         )
 
         for _ in range(num_layers - 1):
             self.layers.append(
-                HeteroRGCNLayer(hidden_dim, hidden_dim, rel_names, ntypes=ntypes, dropout=dropout)
+                HeteroRGCNLayer(hidden_dim, hidden_dim, rel_names,
+                                ntypes=ntypes, dropout=dropout)
             )
 
     def forward(self, g, h_dict):
@@ -322,7 +420,7 @@ class CascadedHeteroModel(BaseModel):
         print(f"Using HGINA + RGCN - Stage {self.stage}")
         print("="*40, "\n\n")
 
-        if self.stage == "3":
+        if self.stage in ["1", "2"]:
             self.hgina_stack = HGINAStack(
                 rel_names=rel_names,
                 node_dims=node_dims,
@@ -345,7 +443,7 @@ class CascadedHeteroModel(BaseModel):
     def forward(self, batch_dict):
         g = batch_dict["graph"]
 
-        if self.stage == "3":
+        if self.stage in ["1", "2"]:
             self.h = self.hgina_stack(g)
         else:
             h_dict = {
