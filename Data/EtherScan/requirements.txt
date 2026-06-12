@@ -1,0 +1,7 @@
+backoff
+datasets
+fastparquet
+pandas
+py-etherscan-api
+pyarrow
+tqdm

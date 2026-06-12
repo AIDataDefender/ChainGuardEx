@@ -1,0 +1,9 @@
+Project: BlockSec-blocksec_impossible_finance_swap_v1.2
+Category: success
+Timestamp: 2025-12-08T15:23:49.572884Z
+ast_edge_count: 1029
+ast_node_count: 1053
+cfg_edge_count: 173
+cfg_node_count: 227
+vuln_entry_count: 12
+vuln_matched_node_count: 68

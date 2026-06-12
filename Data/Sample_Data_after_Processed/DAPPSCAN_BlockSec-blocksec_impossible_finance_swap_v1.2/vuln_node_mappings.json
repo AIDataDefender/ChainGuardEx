@@ -1,0 +1,718 @@
+{
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$53$61$1": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "53",
+    "line_to": "61",
+    "detect_type": "source_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst, uint256 wad) public returns (uint256 transferAmt) {\n        transferAmt = wad.mul(ratioDenom).div(ratioNum);\n        bool success = IERC20(underlying).transferFrom(msg.sender, address(this), transferAmt);\n        require(success, 'ImpossibleWrapper: TRANSFERFROM_FAILED');\n        _deposit(dst, wad);\n        underlyingBalance = underlyingBalance.add(transferAmt);\n        emit Transfer(address(0), msg.sender, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "683": {
+        "expression": "deposit(address dst,uint256 wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "685": {
+        "expression": "transferAmt = wad.mul(ratioDenom).div(ratioNum)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 55,
+        "line_to": 55
+      },
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      },
+      "689": {
+        "expression": "underlyingBalance = underlyingBalance.add(transferAmt)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 59,
+        "line_to": 59
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$65$73$2": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "source_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-114$SC03:2025$65$73$3": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-114-Transaction Order Dependence",
+    "swc_id": "SWC-114",
+    "owasp_id": "SC03:2025",
+    "swc_name": "Transaction Order Dependence",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "source_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$53$61$4": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "53",
+    "line_to": "61",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst, uint256 wad) public returns (uint256 transferAmt) {\n        transferAmt = wad.mul(ratioDenom).div(ratioNum);\n        bool success = IERC20(underlying).transferFrom(msg.sender, address(this), transferAmt);\n        require(success, 'ImpossibleWrapper: TRANSFERFROM_FAILED');\n        _deposit(dst, wad);\n        underlyingBalance = underlyingBalance.add(transferAmt);\n        emit Transfer(address(0), msg.sender, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "683": {
+        "expression": "deposit(address dst,uint256 wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "685": {
+        "expression": "transferAmt = wad.mul(ratioDenom).div(ratioNum)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 55,
+        "line_to": 55
+      },
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      },
+      "689": {
+        "expression": "underlyingBalance = underlyingBalance.add(transferAmt)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 59,
+        "line_to": 59
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$65$73$5": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-114$SC03:2025$65$73$6": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-114-Transaction Order Dependence",
+    "swc_id": "SWC-114",
+    "owasp_id": "SC03:2025",
+    "swc_name": "Transaction Order Dependence",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$53$61$7": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "53",
+    "line_to": "61",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst, uint256 wad) public returns (uint256 transferAmt) {\n        transferAmt = wad.mul(ratioDenom).div(ratioNum);\n        bool success = IERC20(underlying).transferFrom(msg.sender, address(this), transferAmt);\n        require(success, 'ImpossibleWrapper: TRANSFERFROM_FAILED');\n        _deposit(dst, wad);\n        underlyingBalance = underlyingBalance.add(transferAmt);\n        emit Transfer(address(0), msg.sender, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "683": {
+        "expression": "deposit(address dst,uint256 wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "685": {
+        "expression": "transferAmt = wad.mul(ratioDenom).div(ratioNum)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 55,
+        "line_to": 55
+      },
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      },
+      "689": {
+        "expression": "underlyingBalance = underlyingBalance.add(transferAmt)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 59,
+        "line_to": 59
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$65$73$8": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-114$SC03:2025$65$73$9": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-114-Transaction Order Dependence",
+    "swc_id": "SWC-114",
+    "owasp_id": "SC03:2025",
+    "swc_name": "Transaction Order Dependence",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$53$61$10": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "53",
+    "line_to": "61",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst, uint256 wad) public returns (uint256 transferAmt) {\n        transferAmt = wad.mul(ratioDenom).div(ratioNum);\n        bool success = IERC20(underlying).transferFrom(msg.sender, address(this), transferAmt);\n        require(success, 'ImpossibleWrapper: TRANSFERFROM_FAILED');\n        _deposit(dst, wad);\n        underlyingBalance = underlyingBalance.add(transferAmt);\n        emit Transfer(address(0), msg.sender, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "683": {
+        "expression": "deposit(address dst,uint256 wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "685": {
+        "expression": "transferAmt = wad.mul(ratioDenom).div(ratioNum)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 55,
+        "line_to": 55
+      },
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      },
+      "689": {
+        "expression": "underlyingBalance = underlyingBalance.add(transferAmt)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 59,
+        "line_to": 59
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 58,
+        "line_to": 58
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-107$SC05:2025$65$73$11": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-107-Reentrancy",
+    "swc_id": "SWC-107",
+    "owasp_id": "SC05:2025",
+    "swc_name": "Reentrancy",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  },
+  "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol$deposit$SWC-114$SC03:2025$65$73$12": {
+    "project": "BlockSec-blocksec_impossible_finance_swap_v1.2",
+    "file": "impossible-swap-core-29aaef89f996acdbee92b67c4d95fb608dc8b876/contracts/ImpossibleWrappedToken.sol",
+    "function": "deposit",
+    "category": "SWC-114-Transaction Order Dependence",
+    "swc_id": "SWC-114",
+    "owasp_id": "SC03:2025",
+    "swc_name": "Transaction Order Dependence",
+    "line_from": "65",
+    "line_to": "73",
+    "detect_type": "byte_code",
+    "snippet": "    // wad = amount of wrapped tokens\n    function deposit(address dst) public override returns (uint256 transferAmt) {\n        uint256 balance = IERC20(underlying).balanceOf(address(this));\n        transferAmt = balance.sub(underlyingBalance);\n        uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom);\n        _deposit(dst, wad);\n        underlyingBalance = balance;\n        emit Transfer(address(0), dst, wad);\n    }\n",
+    "contract": "ImpossibleWrappedToken",
+    "function_args": "(address,uint256)",
+    "function_full": "deposit(address,uint256)",
+    "nodes": {},
+    "ast_nodes": {
+      "688": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "691": {
+        "expression": "deposit(address dst)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "FunctionDefinition"
+      },
+      "694": {
+        "expression": "transferAmt = balance.sub(underlyingBalance)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 68,
+        "line_to": 68
+      },
+      "695": {
+        "expression": "uint256 wad = transferAmt.mul(ratioNum).div(ratioDenom)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "VariableDeclarationStatement",
+        "line_from": 69,
+        "line_to": 69
+      },
+      "696": {
+        "expression": "_deposit(dst, wad)",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement"
+      },
+      "697": {
+        "expression": "underlyingBalance = balance",
+        "ir": "",
+        "node_type": "ast_node",
+        "sub_node_type": "ExpressionStatement",
+        "line_from": 71,
+        "line_to": 71
+      }
+    }
+  }
+}
